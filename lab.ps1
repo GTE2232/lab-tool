@@ -1,12 +1,8 @@
-﻿<#
-    ===========================================================
-     UIT-63 - FDIV Edition | Lab PC Optimizer
-     made by shivansh
-    ===========================================================
-    Target: Windows 10, low-RAM education lab machines
-             (i5 2nd gen / 4GB DDR3 1600MHz / mechanical HDD)
-
-    Rename the tool by editing $ToolName / $Author below.
+# =========================================================== 
+# UIT-63 - FDIV Edition | Lab PC Optimizer made by shivansh 
+# =========================================================== 
+# Target: Windows 10, low-RAM education lab machines (i5 2nd gen / 4GB DDR3 1600MHz / mechanical HDD) 
+# Rename the tool by editing $ToolName / $Author below. 
 #>
 
 $ToolName = "UIT-63 - FDIV Edition"

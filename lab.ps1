@@ -1,5 +1,5 @@
 # =========================================================== 
-# UIT-63 - FDIV Edition | Lab PC Optimizer made by shivansh 
+# UIT-63 - FDIV Edition | PC Fallback Optimizer made by shivansh 
 # =========================================================== 
 # Target: Windows 10, low-RAM education lab machines (i5 2nd gen / 4GB DDR3 1600MHz / mechanical HDD) 
 # Rename the tool by editing $ToolName / $Author below. 
@@ -143,8 +143,8 @@ public class SPI {
 
 $SPIFLAGS = [uint32](0x01 -bor 0x02)
 function Set-SPI($action, [bool]$onOff) {
-    $val = if ($onOff) { [IntPtr]1 } else { [IntPtr]0 }
-    [SPI]::SystemParametersInfo($action, 0, $val, $SPIFLAGS) | Out-Null
+    $uiParam = if ($onOff) { 1 } else { 0 }
+    [SPI]::SystemParametersInfo($action, $uiParam, [IntPtr]::Zero, $SPIFLAGS) | Out-Null
 }
 
 function Assert-FontSmoothingOn {
@@ -769,6 +769,30 @@ function Register-PhotoViewerApplication {
 }
 
 function Set-PhotoViewerDefault {
+    # Diagnose the two most likely reasons this fails outright, before
+    # attempting anything, so the failure reason is visible rather than silent.
+    $dllPath = "$env:ProgramFiles\Windows Photo Viewer\PhotoViewer.dll"
+    if (-not (Test-Path $dllPath)) {
+        Write-Host "  PROBLEM FOUND: $dllPath does not exist on this machine." -ForegroundColor Red
+        Write-Host "  Windows Photo Viewer's own program files were never installed or were" -ForegroundColor Red
+        Write-Host "  removed from this Windows image. Registering it as default is pointless" -ForegroundColor Red
+        Write-Host "  if the file it points to doesn't exist - nothing will actually open." -ForegroundColor Red
+        Write-Host "  This is a per-machine Windows image issue, not something this script can fix." -ForegroundColor Red
+        return
+    }
+
+    try {
+        $edition = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+    } catch { $edition = "" }
+    if ($edition -match "Home") {
+        Write-Host "  Note: this is Windows 10 Home. The Group Policy mechanism used to force" -ForegroundColor Yellow
+        Write-Host "  a default app on an existing profile is only reliably processed on" -ForegroundColor Yellow
+        Write-Host "  Pro/Education/Enterprise editions - Home edition often ignores it entirely." -ForegroundColor Yellow
+        Write-Host "  Proceeding anyway, but if it doesn't take effect after a logoff/logon," -ForegroundColor Yellow
+        Write-Host "  that's why - the manual Settings > Default Apps method is the only" -ForegroundColor Yellow
+        Write-Host "  guaranteed-to-work path on Home edition." -ForegroundColor Yellow
+    }
+
     Register-PhotoViewerApplication
 
     # The GPO-driven "default associations configuration file" mechanism -
@@ -859,6 +883,28 @@ function Set-MacRandomization([bool]$Enable) {
     }
 }
 
+function Install-SingleApp($app) {
+    if (Get-AppxPackage -Name $app -ErrorAction SilentlyContinue) {
+        Write-Host "  $app is already installed." -ForegroundColor Yellow
+        return
+    }
+    if ($null -eq $Global:WingetOk) { $Global:WingetOk = Ensure-Winget }
+    if ($Global:WingetOk) {
+        Write-Host "  Installing $app via winget (Microsoft Store source)..." -ForegroundColor Cyan
+        try {
+            winget install --id $app --source msstore --silent --accept-package-agreements --accept-source-agreements 2>$null 1>$null
+        } catch {}
+        if (Get-AppxPackage -Name $app -ErrorAction SilentlyContinue) {
+            Write-Host "  Installed $app." -ForegroundColor Green
+            Write-PrevLog "Reinstalled: $app"
+        } else {
+            Write-Host "  Could not install $app automatically - it may not be in the Store catalog under that ID." -ForegroundColor DarkYellow
+        }
+    } else {
+        Write-Host "  Winget isn't available - open the Microsoft Store app and search for $app manually." -ForegroundColor Yellow
+    }
+}
+
 function Menu-InstallApps {
     while ($true) {
         Show-Banner
@@ -877,39 +923,37 @@ function Menu-InstallApps {
             $num++
         }
         Write-Host ""
+        Write-Host "  A. Install ALL not-installed apps in this list"
+        Write-Host "  0. Back to main menu"
+        Write-Host ""
         Write-Host "  Reinstall attempts via winget + Microsoft Store - success depends on" -ForegroundColor DarkGray
         Write-Host "  whether that app is still listed there. If it fails, search the Store" -ForegroundColor DarkGray
         Write-Host "  app manually for the app name as a fallback." -ForegroundColor DarkGray
         Write-Host ""
-        $choice = Read-Host "Enter a number to install that app (0 = back to main menu)"
+        $choice = Read-Host "Enter a number, A for all, or 0 to go back"
         if ($choice -eq '0') { return }
+
+        if ($choice -match '^[Aa]$') {
+            $toInstall = $sorted | Where-Object { -not (Get-AppxPackage -Name $_ -ErrorAction SilentlyContinue) }
+            if ($toInstall.Count -eq 0) {
+                Write-Host "`nEverything in this list is already installed." -ForegroundColor Yellow
+            } else {
+                Write-Host "`nInstalling $($toInstall.Count) app(s)..." -ForegroundColor Cyan
+                foreach ($app in $toInstall) { Install-SingleApp $app }
+                Write-Host "`nDone." -ForegroundColor Green
+            }
+            Read-Host "`nPress Enter to continue"
+            continue
+        }
+
         $idNum = 0
         if (-not ([int]::TryParse($choice, [ref]$idNum)) -or -not $lookup.ContainsKey($idNum)) {
             Write-Host "`nInvalid choice." -ForegroundColor Red
             Start-Sleep -Seconds 1
             continue
         }
-        $app = $lookup[$idNum]
-        if (Get-AppxPackage -Name $app -ErrorAction SilentlyContinue) {
-            Write-Host "`n$app is already installed." -ForegroundColor Yellow
-        } else {
-            if ($null -eq $Global:WingetOk) { $Global:WingetOk = Ensure-Winget }
-            if ($Global:WingetOk) {
-                Write-Host "`nAttempting to install $app via winget (Microsoft Store source)..." -ForegroundColor Cyan
-                try {
-                    winget install --id $app --source msstore --silent --accept-package-agreements --accept-source-agreements 2>$null 1>$null
-                } catch {}
-                if (Get-AppxPackage -Name $app -ErrorAction SilentlyContinue) {
-                    Write-Host "Installed $app." -ForegroundColor Green
-                    Write-PrevLog "Reinstalled: $app"
-                } else {
-                    Write-Host "Could not install $app automatically - it may not be in the Store catalog under that ID." -ForegroundColor DarkYellow
-                    Write-Host "Try opening the Microsoft Store app and searching for it manually." -ForegroundColor DarkYellow
-                }
-            } else {
-                Write-Host "`nWinget isn't available - open the Microsoft Store app and search for $app manually." -ForegroundColor Yellow
-            }
-        }
+        Write-Host ""
+        Install-SingleApp $lookup[$idNum]
         Read-Host "`nPress Enter to continue"
     }
 }
@@ -931,8 +975,30 @@ function Menu-AdditionalTweaks {
         $sel = Read-Host "Select an option"
         Write-Host ""
         switch ($sel) {
-            '1' { Set-PhotoViewerDefault; Write-PrevLog "Additional: Photo Viewer set as default" }
-            '2' { Restore-PhotosAppDefault; Write-PrevLog "Additional: Photos app default restored" }
+            '1' {
+                Set-PhotoViewerDefault
+                Write-PrevLog "Additional: Photo Viewer set as default"
+                Write-Host ""
+                Write-Host "  Honest limitation: Windows won't let ANY script (this one or DISM/GPO" -ForegroundColor Yellow
+                Write-Host "  directly) override an already-established default on an existing profile" -ForegroundColor Yellow
+                Write-Host "  - that protection is intentional. Photo Viewer is now registered and" -ForegroundColor Yellow
+                Write-Host "  available to pick, but the final selection needs one manual step." -ForegroundColor Yellow
+                Write-Host ""
+                $open = Read-Host "Open Settings > Default Apps now to pick it? (Y/N)"
+                if ($open -match '^[Yy]') {
+                    Start-Process "ms-settings:defaultapps"
+                    Write-Host "  In Settings, search 'Windows Photo Viewer' or set it per image type (.jpg, .png, etc)." -ForegroundColor Cyan
+                }
+            }
+            '2' {
+                Restore-PhotosAppDefault
+                Write-PrevLog "Additional: Photos app default restored"
+                Write-Host ""
+                $open = Read-Host "Open Settings > Default Apps now to pick Photos? (Y/N)"
+                if ($open -match '^[Yy]') {
+                    Start-Process "ms-settings:defaultapps"
+                }
+            }
             '3' { Set-DnsProvider "8.8.8.8" "8.8.4.4" "Google"; Write-PrevLog "Additional: DNS set to Google" }
             '4' { Set-DnsProvider "1.1.1.1" "1.0.0.1" "Cloudflare"; Write-PrevLog "Additional: DNS set to Cloudflare" }
             '5' { Reset-DnsAutomatic; Write-PrevLog "Additional: DNS reset to automatic" }
@@ -1037,6 +1103,7 @@ function Apply-AllBase {
     Write-PrevLog "=== Apply All (base tweaks) finished ==="
     Write-Host "Base tweaks applied." -ForegroundColor Green
     Save-Snapshot "Apply All (base)"
+    Start-Sleep -Seconds 2
     Assert-FontSmoothingOn
 }
 
@@ -1057,6 +1124,7 @@ function Apply-All4GB {
     Write-PrevLog "=== Apply 4GB RAM tier finished ==="
     Write-Host "4GB RAM tweaks applied." -ForegroundColor Green
     Save-Snapshot "Apply 4GB RAM tier"
+    Start-Sleep -Seconds 2
     Assert-FontSmoothingOn
 }
 
@@ -1077,6 +1145,7 @@ function Disable-AllApplied {
     Write-PrevLog "=== Disable All Applied finished ==="
     Write-Host "Done." -ForegroundColor Green
     Save-Snapshot "Disable All Applied"
+    Start-Sleep -Seconds 2
     Assert-FontSmoothingOn
 }
 

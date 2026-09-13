@@ -845,6 +845,30 @@ function Restore-PhotosAppDefault {
     Write-Host "  default (Photos app) to take effect again." -ForegroundColor Green
 }
 
+function Register-DnsEnforcer($Primary, $Secondary, $Label) {
+    # DNS settings can be lost across reboots on some hardware (interface
+    # index renumbering on driver reinit, or a router/domain policy
+    # re-asserting DNS at boot). Rather than diagnose which one applies here,
+    # this reapplies the chosen DNS at every startup, running as SYSTEM so it
+    # works even before anyone logs in.
+    try {
+        $taskName = "UIT63-DnsEnforcer"
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        $cmd = "Get-NetAdapter | Where-Object { `$_.Status -eq 'Up' } | ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex `$_.IfIndex -ServerAddresses ('$Primary','$Secondary') }"
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -Command `"$cmd`""
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal `
+            -Description "UIT-63 FDIV: keeps DNS set to $Label at every boot" -Force | Out-Null
+    } catch {
+        Write-Host "  Could not register DNS enforcer task: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
+
+function Remove-DnsEnforcer {
+    try { Unregister-ScheduledTask -TaskName "UIT63-DnsEnforcer" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+}
+
 function Set-DnsProvider($Primary, $Secondary, $Label) {
     $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
     if (-not $adapters) { Write-Host "  No active network adapter found." -ForegroundColor DarkGray; return }
@@ -852,7 +876,9 @@ function Set-DnsProvider($Primary, $Secondary, $Label) {
         try { Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ServerAddresses ($Primary, $Secondary) -ErrorAction Stop }
         catch { Write-Host "  Could not set DNS on $($a.Name): $($_.Exception.Message)" -ForegroundColor DarkYellow }
     }
+    Register-DnsEnforcer $Primary $Secondary $Label
     Write-Host "  DNS set to $Label ($Primary, $Secondary) on active adapter(s)." -ForegroundColor Green
+    Write-Host "  Also registered a startup task to reapply this at every boot, in case it doesn't persist on its own." -ForegroundColor DarkGray
 }
 
 function Reset-DnsAutomatic {
@@ -862,6 +888,7 @@ function Reset-DnsAutomatic {
         try { Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ResetServerAddresses -ErrorAction Stop }
         catch { Write-Host "  Could not reset DNS on $($a.Name): $($_.Exception.Message)" -ForegroundColor DarkYellow }
     }
+    Remove-DnsEnforcer
     Write-Host "  DNS reset to automatic (DHCP) on active adapter(s)." -ForegroundColor Green
 }
 

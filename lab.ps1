@@ -131,6 +131,60 @@ function Set-TaskState($TaskPath, $TaskName, [bool]$Disable) {
     }
 }
 
+# ---- Global Timer Resolution (Windows 7-style 8ms system tick) ----
+# Timer resolution isn't a static registry value - it's held open by a
+# running process via the multimedia timer API. Windows auto-reverts it the
+# instant that process exits. This writes a small persistent script and runs
+# it hidden, both immediately and at every logon, so 8ms stays held for as
+# long as the tweak is enabled - killing the process (done on disable)
+# releases it automatically, no separate cleanup call needed.
+$TimerResDir = "$env:ProgramData\UIT63"
+$TimerResScript = "$TimerResDir\TimerResEnforcer.ps1"
+$TimerResTask = "UIT63-TimerResolutionEnforcer"
+
+function Install-TimerResolutionEnforcer {
+    if (-not (Test-Path $TimerResDir)) { New-Item -Path $TimerResDir -ItemType Directory -Force | Out-Null }
+    $body = @'
+Add-Type -Namespace UIT63 -Name Winmm -MemberDefinition @"
+[DllImport("winmm.dll")]
+public static extern uint timeBeginPeriod(uint uMilliseconds);
+"@
+[UIT63.Winmm]::timeBeginPeriod(8) | Out-Null
+while ($true) { Start-Sleep -Seconds 3600 }
+'@
+    Set-Content -Path $TimerResScript -Value $body -Encoding UTF8
+
+    # Kill any previous instance before starting a fresh one
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match [regex]::Escape($TimerResScript) } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-File', "`"$TimerResScript`"")
+
+    try {
+        Unregister-ScheduledTask -TaskName $TimerResTask -Confirm:$false -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -File `"$TimerResScript`""
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        Register-ScheduledTask -TaskName $TimerResTask -Action $action -Trigger $trigger `
+            -Description "UIT-63 FDIV: holds an 8ms Windows 7-style global timer resolution" -Force | Out-Null
+    } catch {
+        Write-Host "  Could not register timer resolution startup task: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
+
+function Remove-TimerResolutionEnforcer {
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match [regex]::Escape($TimerResScript) } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    try { Unregister-ScheduledTask -TaskName $TimerResTask -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+}
+
+function Test-TimerResolutionEnforcerRunning {
+    $running = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match [regex]::Escape($TimerResScript) }
+    return [bool]$running
+}
+
 # P/Invoke for individual visual-effect toggles (SystemParametersInfo)
 Add-Type @"
 using System;
@@ -272,6 +326,21 @@ $TweakInfo = @{
     39 = @{ Name = "Location tracking - off (system-wide)";       Tier = "Base" }
     40 = @{ Name = "Mobile broadband metadata parser task - off"; Tier = "Base" }
     41 = @{ Name = "Speech model background download task - off"; Tier = "Base" }
+    42 = @{ Name = "Global Timer Resolution restored to 8ms (Win7-style)"; Tier = "Base" }
+    43 = @{ Name = "Compatibility Appraiser telemetry task - off"; Tier = "Base" }
+    44 = @{ Name = "OneDrive uninstalled"; Tier = "Base" }
+    45 = @{ Name = "Cloud content search - off"; Tier = "Base" }
+    46 = @{ Name = "SafeSearch - off"; Tier = "Base" }
+    47 = @{ Name = "Search history - off"; Tier = "Base" }
+    48 = @{ Name = "Inking & typing personalization - off"; Tier = "Base" }
+    49 = @{ Name = "Locally relevant content via language list - off"; Tier = "Base" }
+    50 = @{ Name = "Game Bar - off"; Tier = "Base" }
+    51 = @{ Name = "Copilot app - uninstalled"; Tier = "Base" }
+    52 = @{ Name = "Cortana leftover shortcuts - cleaned up"; Tier = "Base" }
+    53 = @{ Name = "Autocorrect misspelled words - off"; Tier = "Base" }
+    54 = @{ Name = "Highlight misspelled words - off"; Tier = "Base" }
+    55 = @{ Name = "Show text suggestions - off"; Tier = "Base" }
+    56 = @{ Name = "Multitasking (Snap) - off"; Tier = "Base" }
 }
 
 # ===========================================================
@@ -334,6 +403,38 @@ function Test-TweakApplied($Id) {
         39 { return (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors" "DisableLocation") -eq 1 }
         40 { return Get-TaskDisabled "\Microsoft\Windows\Mobile Broadband Accounts\" "MNO Metadata Parser Task" }
         41 { return Get-TaskDisabled "\Microsoft\Windows\Speech\" "SpeechModelDownloadTask" }
+        42 {
+            $regOk = (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel" "GlobalTimerResolutionRequests") -eq 1
+            return $regOk -and (Test-TimerResolutionEnforcerRunning)
+        }
+        43 { return Get-TaskDisabled "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" }
+        44 { return -not (Test-Path "$env:SystemRoot\SysWOW64\OneDriveSetup.exe") -and -not (Test-Path "$env:SystemRoot\System32\OneDriveSetup.exe") -and -not (Get-Process OneDrive -ErrorAction SilentlyContinue) }
+        45 {
+            return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsMSACloudSearchEnabled") -eq 0 -and
+                   (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsAADCloudSearchEnabled") -eq 0
+        }
+        46 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SearchSettings" "SafeSearchMode") -eq 0 }
+        47 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "IsDeviceSearchHistoryEnabled") -eq 0 }
+        48 {
+            return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitInkCollection") -eq 1 -and
+                   (Get-RegValue "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitTextCollection") -eq 1
+        }
+        49 { return (Get-RegValue "HKCU:\Control Panel\International\User Profile" "HttpAcceptLanguageOptOut") -eq 1 }
+        50 {
+            return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled") -eq 0 -and
+                   (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR") -eq 0
+        }
+        51 {
+            $names = @("Microsoft.Copilot", "Microsoft.Windows.Copilot", "MicrosoftWindows.Client.CoPilot")
+            $present = $false
+            foreach ($n in $names) { if (Get-AppxPackage -Name $n -ErrorAction SilentlyContinue) { $present = $true } }
+            return (-not $present)
+        }
+        52 { return -not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Cortana.lnk") -and -not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Cortana.lnk") }
+        53 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableAutocorrection") -eq 0 }
+        54 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableSpellchecking") -eq 0 }
+        55 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableTextPrediction") -eq 0 }
+        56 { return (Get-RegValue "HKCU:\Control Panel\Desktop" "WindowArrangementActive") -eq "0" }
     }
     return $false
 }
@@ -388,7 +489,10 @@ function Enable-Tweak($Id) {
         }
         24 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency" 0 }
         25 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "IconsOnly" 1 }
-        26 { powercfg /hibernate off }
+        26 {
+            powercfg /hibernate off
+            Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 0
+        }
         27 {
             foreach ($app in $BundledApps) {
                 # Try current-user scope first - this is the method that reliably
@@ -477,6 +581,77 @@ function Enable-Tweak($Id) {
         39 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors" "DisableLocation" 1 }
         40 { Set-TaskState "\Microsoft\Windows\Mobile Broadband Accounts\" "MNO Metadata Parser Task" $true }
         41 { Set-TaskState "\Microsoft\Windows\Speech\" "SpeechModelDownloadTask" $true }
+        42 {
+            Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel" "GlobalTimerResolutionRequests" 1
+            Install-TimerResolutionEnforcer
+            Write-Host "  Global timer resolution restored to Windows 7-style behavior, held at 8ms." -ForegroundColor Green
+        }
+        43 { Set-TaskState "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" $true }
+        44 {
+            $paths = @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
+            Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            foreach ($path in $paths) {
+                if (Test-Path $path) {
+                    try { Start-Process $path -ArgumentList "/uninstall" -Wait -ErrorAction Stop }
+                    catch { Write-Host "  OneDrive uninstall failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+                }
+            }
+        }
+        45 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsMSACloudSearchEnabled" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsAADCloudSearchEnabled" 0
+        }
+        46 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SearchSettings" "SafeSearchMode" 0 }
+        47 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "IsDeviceSearchHistoryEnabled" 0 }
+        48 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 1
+        }
+        49 { Set-Reg "HKCU:\Control Panel\International\User Profile" "HttpAcceptLanguageOptOut" 1 }
+        50 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
+            Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
+            Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
+        }
+        51 {
+            $names = @("Microsoft.Copilot", "Microsoft.Windows.Copilot", "MicrosoftWindows.Client.CoPilot")
+            foreach ($n in $names) {
+                try {
+                    $pkg = Get-AppxPackage -Name $n -ErrorAction SilentlyContinue
+                    if ($pkg) { $pkg | Remove-AppxPackage -ErrorAction SilentlyContinue }
+                } catch {}
+                try {
+                    $prov = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -eq $n }
+                    if ($prov) { $prov | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null }
+                } catch {}
+                if (Get-AppxPackage -Name $n -ErrorAction SilentlyContinue) {
+                    try {
+                        $pkgAll = Get-AppxPackage -Name $n -AllUsers -ErrorAction SilentlyContinue
+                        if ($pkgAll) { $pkgAll | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue }
+                    } catch {}
+                }
+            }
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowCopilotButton" 0
+            $stillThere = $false
+            foreach ($n in $names) { if (Get-AppxPackage -Name $n -ErrorAction SilentlyContinue) { $stillThere = $true } }
+            if ($stillThere) {
+                Write-Host "  Copilot could not be fully removed via AppX cmdlets - on some Windows 11 builds it is a" -ForegroundColor DarkYellow
+                Write-Host "  protected inbox component rather than a normal removable app. The taskbar button and" -ForegroundColor DarkYellow
+                Write-Host "  policy access have still been disabled above." -ForegroundColor DarkYellow
+            }
+        }
+        52 {
+            $links = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Cortana.lnk", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Cortana.lnk")
+            foreach ($link in $links) { if (Test-Path $link) { Remove-Item $link -Force -ErrorAction SilentlyContinue } }
+        }
+        53 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableAutocorrection" 0 }
+        54 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableSpellchecking" 0 }
+        55 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableTextPrediction" 0 }
+        56 {
+            Set-Reg "HKCU:\Control Panel\Desktop" "WindowArrangementActive" "0" String
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapAssist" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapFill" 0
+        }
     }
 }
 
@@ -529,7 +704,10 @@ function Disable-Tweak($Id) {
         }
         24 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency" 1 }
         25 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "IconsOnly" 0 }
-        26 { powercfg /hibernate on }
+        26 {
+            powercfg /hibernate on
+            Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" "HiberbootEnabled" 1
+        }
         27 { Write-Host "  App removal cannot be auto-reversed - reinstall from Microsoft Store if needed." -ForegroundColor Yellow }
         28 { Set-SvcState 'PcaSvc' $false }
         29 { Remove-Reg "HKLM:\SYSTEM\CurrentControlSet\Control" "SvcHostSplitThresholdInKB" }
@@ -576,6 +754,39 @@ function Disable-Tweak($Id) {
         39 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors" "DisableLocation" 0 }
         40 { Set-TaskState "\Microsoft\Windows\Mobile Broadband Accounts\" "MNO Metadata Parser Task" $false }
         41 { Set-TaskState "\Microsoft\Windows\Speech\" "SpeechModelDownloadTask" $false }
+        42 {
+            Remove-TimerResolutionEnforcer
+            Remove-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel" "GlobalTimerResolutionRequests"
+            Write-Host "  Global timer resolution override removed - back to Windows 10/11 default per-process behavior." -ForegroundColor Green
+        }
+        43 { Set-TaskState "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" $false }
+        44 { Write-Host "  OneDrive removal cannot be auto-reversed - reinstall from https://www.microsoft.com/microsoft-365/onedrive/download if needed." -ForegroundColor Yellow }
+        45 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsMSACloudSearchEnabled" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsAADCloudSearchEnabled" 1
+        }
+        46 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SearchSettings" "SafeSearchMode" 1 }
+        47 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "IsDeviceSearchHistoryEnabled" 1 }
+        48 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 0
+        }
+        49 { Set-Reg "HKCU:\Control Panel\International\User Profile" "HttpAcceptLanguageOptOut" 0 }
+        50 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 1
+            Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 1
+            Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 1
+        }
+        51 { Write-Host "  Copilot removal cannot be auto-reversed - reinstall from Microsoft Store if needed." -ForegroundColor Yellow }
+        52 { Write-Host "  Shortcut cleanup cannot be auto-reversed - this is cosmetic only, no functionality is lost either way." -ForegroundColor Yellow }
+        53 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableAutocorrection" 1 }
+        54 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableSpellchecking" 1 }
+        55 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableTextPrediction" 1 }
+        56 {
+            Set-Reg "HKCU:\Control Panel\Desktop" "WindowArrangementActive" "1" String
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapAssist" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapFill" 1
+        }
     }
 }
 

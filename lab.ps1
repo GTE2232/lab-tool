@@ -131,6 +131,33 @@ function Set-TaskState($TaskPath, $TaskName, [bool]$Disable) {
     }
 }
 
+# ---- Genuinely-hidden scheduled task launcher ----
+# "-WindowStyle Hidden" on powershell.exe is unreliable when Windows Terminal
+# is the default terminal app - it can still flash or open a visible window
+# at logon/startup. WScript.Shell.Run with window style 0 hides the window
+# at the OS level regardless of terminal settings, which is the reliable way
+# to run something via Task Scheduler with truly no visible window.
+function New-HiddenTaskAction($VbsPath, $InnerCommandLine) {
+    $dir = Split-Path $VbsPath -Parent
+    if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+    $escaped = $InnerCommandLine -replace '"', '""'
+    $vbs = "Set objShell = CreateObject(`"WScript.Shell`")`r`nobjShell.Run `"$escaped`", 0, False"
+    Set-Content -Path $VbsPath -Value $vbs -Encoding ASCII
+    return (New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$VbsPath`"")
+}
+
+function Start-Hidden($InnerCommandLine) {
+    # One-off equivalent of New-HiddenTaskAction, for launching something
+    # immediately (not via a scheduled task) with a genuinely hidden window.
+    $vbsPath = "$env:TEMP\uit63-hidden-launch-$([guid]::NewGuid().ToString('N')).vbs"
+    $escaped = $InnerCommandLine -replace '"', '""'
+    $vbs = "Set objShell = CreateObject(`"WScript.Shell`")`r`nobjShell.Run `"$escaped`", 0, False"
+    Set-Content -Path $vbsPath -Value $vbs -Encoding ASCII
+    Start-Process wscript.exe -ArgumentList "`"$vbsPath`"" -WindowStyle Hidden
+    Start-Sleep -Milliseconds 300
+    Remove-Item $vbsPath -Force -ErrorAction SilentlyContinue
+}
+
 # ---- Global Timer Resolution (Windows 7-style 8ms system tick) ----
 # Timer resolution isn't a static registry value - it's held open by a
 # running process via the multimedia timer API. Windows auto-reverts it the
@@ -138,13 +165,19 @@ function Set-TaskState($TaskPath, $TaskName, [bool]$Disable) {
 # it hidden, both immediately and at every logon, so 8ms stays held for as
 # long as the tweak is enabled - killing the process (done on disable)
 # releases it automatically, no separate cleanup call needed.
+#
+# Status is tracked via a PID file rather than matching process command
+# lines - CommandLine matching via CIM is unreliable across quoting
+# variations and was the cause of this tweak never reporting as applied.
 $TimerResDir = "$env:ProgramData\UIT63"
 $TimerResScript = "$TimerResDir\TimerResEnforcer.ps1"
+$TimerResPidFile = "$TimerResDir\enforcer.pid"
 $TimerResTask = "UIT63-TimerResolutionEnforcer"
 
 function Install-TimerResolutionEnforcer {
     if (-not (Test-Path $TimerResDir)) { New-Item -Path $TimerResDir -ItemType Directory -Force | Out-Null }
     $body = @'
+$PID | Out-File -FilePath "__PIDFILE__" -Encoding ascii -Force
 Add-Type -Namespace UIT63 -Name Winmm -MemberDefinition @"
 [DllImport("winmm.dll")]
 public static extern uint timeBeginPeriod(uint uMilliseconds);
@@ -152,18 +185,30 @@ public static extern uint timeBeginPeriod(uint uMilliseconds);
 [UIT63.Winmm]::timeBeginPeriod(8) | Out-Null
 while ($true) { Start-Sleep -Seconds 3600 }
 '@
+    $body = $body -replace '__PIDFILE__', $TimerResPidFile
     Set-Content -Path $TimerResScript -Value $body -Encoding UTF8
 
-    # Kill any previous instance before starting a fresh one
-    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match [regex]::Escape($TimerResScript) } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    # Stop any previous instance tracked by the PID file before starting fresh
+    if (Test-Path $TimerResPidFile) {
+        $oldPid = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue
+        if ($oldPid) { Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue }
+        Remove-Item $TimerResPidFile -Force -ErrorAction SilentlyContinue
+    }
 
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-File', "`"$TimerResScript`"")
+    # Genuinely hidden launch (not "-WindowStyle Hidden", which is unreliable
+    # under Windows Terminal) - the script writes its own PID to the pid file
+    # as its first action, so tracking works the same way whether launched
+    # here or by the scheduled task below.
+    Start-Hidden "powershell.exe -NoProfile -WindowStyle Hidden -File `"$TimerResScript`""
+    Start-Sleep -Milliseconds 800
+    if (-not (Test-Path $TimerResPidFile)) {
+        Write-Host "  Could not confirm the timer resolution process started." -ForegroundColor DarkYellow
+    }
 
     try {
         Unregister-ScheduledTask -TaskName $TimerResTask -Confirm:$false -ErrorAction SilentlyContinue
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -File `"$TimerResScript`""
+        $vbsPath = "$TimerResDir\TimerResLauncher.vbs"
+        $action = New-HiddenTaskAction $vbsPath "powershell.exe -NoProfile -WindowStyle Hidden -File `"$TimerResScript`""
         $trigger = New-ScheduledTaskTrigger -AtLogOn
         Register-ScheduledTask -TaskName $TimerResTask -Action $action -Trigger $trigger `
             -Description "UIT-63 FDIV: holds an 8ms Windows 7-style global timer resolution" -Force | Out-Null
@@ -173,16 +218,20 @@ while ($true) { Start-Sleep -Seconds 3600 }
 }
 
 function Remove-TimerResolutionEnforcer {
-    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match [regex]::Escape($TimerResScript) } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $TimerResPidFile) {
+        $oldPid = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue
+        if ($oldPid) { Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue }
+        Remove-Item $TimerResPidFile -Force -ErrorAction SilentlyContinue
+    }
     try { Unregister-ScheduledTask -TaskName $TimerResTask -Confirm:$false -ErrorAction SilentlyContinue } catch {}
 }
 
 function Test-TimerResolutionEnforcerRunning {
-    $running = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match [regex]::Escape($TimerResScript) }
-    return [bool]$running
+    if (-not (Test-Path $TimerResPidFile)) { return $false }
+    $storedPid = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue
+    if (-not $storedPid) { return $false }
+    $proc = Get-Process -Id $storedPid -ErrorAction SilentlyContinue
+    return [bool]$proc
 }
 
 # P/Invoke for individual visual-effect toggles (SystemParametersInfo)
@@ -221,9 +270,10 @@ function Register-FontSmoothingEnforcer {
     # re-applies it at every logon regardless of whether the tool ever runs again.
     try {
         $taskName = "UIT63-FontSmoothingEnforcer"
-        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { return }
-        $cmd = '-WindowStyle Hidden -NoProfile -Command "Set-ItemProperty -Path ''HKCU:\Control Panel\Desktop'' -Name FontSmoothing -Value ''2''; Set-ItemProperty -Path ''HKCU:\Control Panel\Desktop'' -Name FontSmoothingType -Value 2 -Type DWord"'
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $cmd
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        $innerCmd = 'powershell.exe -NoProfile -WindowStyle Hidden -Command "Set-ItemProperty -Path ''HKCU:\Control Panel\Desktop'' -Name FontSmoothing -Value ''2''; Set-ItemProperty -Path ''HKCU:\Control Panel\Desktop'' -Name FontSmoothingType -Value 2 -Type DWord"'
+        $vbsPath = "$env:ProgramData\UIT63\FontSmoothingLauncher.vbs"
+        $action = New-HiddenTaskAction $vbsPath $innerCmd
         $trigger = New-ScheduledTaskTrigger -AtLogOn
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
             -Description "UIT-63 FDIV: keeps ClearType font smoothing on at every logon" -Force | Out-Null
@@ -408,13 +458,18 @@ function Test-TweakApplied($Id) {
             return $regOk -and (Test-TimerResolutionEnforcerRunning)
         }
         43 { return Get-TaskDisabled "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" }
-        44 { return -not (Test-Path "$env:SystemRoot\SysWOW64\OneDriveSetup.exe") -and -not (Test-Path "$env:SystemRoot\System32\OneDriveSetup.exe") -and -not (Get-Process OneDrive -ErrorAction SilentlyContinue) }
+        44 {
+            $onedrivePaths = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe", "$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
+            $present = $false
+            foreach ($p in $onedrivePaths) { if (Test-Path $p) { $present = $true } }
+            return (-not $present) -and (-not (Get-Process OneDrive -ErrorAction SilentlyContinue))
+        }
         45 {
             return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsMSACloudSearchEnabled") -eq 0 -and
                    (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsAADCloudSearchEnabled") -eq 0
         }
-        46 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SearchSettings" "SafeSearchMode") -eq 0 }
-        47 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "IsDeviceSearchHistoryEnabled") -eq 0 }
+        46 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "SafeSearchMode") -eq 0 }
+        47 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsDeviceSearchHistoryEnabled") -eq 0 }
         48 {
             return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitInkCollection") -eq 1 -and
                    (Get-RegValue "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitTextCollection") -eq 1
@@ -431,9 +486,21 @@ function Test-TweakApplied($Id) {
             return (-not $present)
         }
         52 { return -not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Cortana.lnk") -and -not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Cortana.lnk") }
-        53 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableAutocorrection") -eq 0 }
-        54 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableSpellchecking") -eq 0 }
-        55 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableTextPrediction") -eq 0 }
+        53 {
+            $v1 = Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableAutocorrection"
+            $v2 = Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings\Hardware Keyboard" "EnableAutocorrection"
+            return ($v1 -eq 0) -or ($v2 -eq 0)
+        }
+        54 {
+            $v1 = Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableSpellchecking"
+            $v2 = Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings\Hardware Keyboard" "EnableSpellchecking"
+            return ($v1 -eq 0) -or ($v2 -eq 0)
+        }
+        55 {
+            $v1 = Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableTextPrediction"
+            $v2 = Get-RegValue "HKCU:\SOFTWARE\Microsoft\Input\Settings\Hardware Keyboard" "EnableTextPrediction"
+            return ($v1 -eq 0) -or ($v2 -eq 0)
+        }
         56 { return (Get-RegValue "HKCU:\Control Panel\Desktop" "WindowArrangementActive") -eq "0" }
     }
     return $false
@@ -588,7 +655,7 @@ function Enable-Tweak($Id) {
         }
         43 { Set-TaskState "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" $true }
         44 {
-            $paths = @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
+            $paths = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe", "$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
             Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             foreach ($path in $paths) {
                 if (Test-Path $path) {
@@ -601,8 +668,8 @@ function Enable-Tweak($Id) {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsMSACloudSearchEnabled" 0
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsAADCloudSearchEnabled" 0
         }
-        46 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SearchSettings" "SafeSearchMode" 0 }
-        47 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "IsDeviceSearchHistoryEnabled" 0 }
+        46 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "SafeSearchMode" 0 }
+        47 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsDeviceSearchHistoryEnabled" 0 }
         48 {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 1
             Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 1
@@ -644,9 +711,18 @@ function Enable-Tweak($Id) {
             $links = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Cortana.lnk", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Cortana.lnk")
             foreach ($link in $links) { if (Test-Path $link) { Remove-Item $link -Force -ErrorAction SilentlyContinue } }
         }
-        53 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableAutocorrection" 0 }
-        54 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableSpellchecking" 0 }
-        55 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableTextPrediction" 0 }
+        53 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableAutocorrection" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings\Hardware Keyboard" "EnableAutocorrection" 0
+        }
+        54 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableSpellchecking" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings\Hardware Keyboard" "EnableSpellchecking" 0
+        }
+        55 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableTextPrediction" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings\Hardware Keyboard" "EnableTextPrediction" 0
+        }
         56 {
             Set-Reg "HKCU:\Control Panel\Desktop" "WindowArrangementActive" "0" String
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapAssist" 0
@@ -765,8 +841,8 @@ function Disable-Tweak($Id) {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsMSACloudSearchEnabled" 1
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsAADCloudSearchEnabled" 1
         }
-        46 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SearchSettings" "SafeSearchMode" 1 }
-        47 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "IsDeviceSearchHistoryEnabled" 1 }
+        46 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "SafeSearchMode" 1 }
+        47 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsDeviceSearchHistoryEnabled" 1 }
         48 {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 0
             Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 0
@@ -779,9 +855,18 @@ function Disable-Tweak($Id) {
         }
         51 { Write-Host "  Copilot removal cannot be auto-reversed - reinstall from Microsoft Store if needed." -ForegroundColor Yellow }
         52 { Write-Host "  Shortcut cleanup cannot be auto-reversed - this is cosmetic only, no functionality is lost either way." -ForegroundColor Yellow }
-        53 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableAutocorrection" 1 }
-        54 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableSpellchecking" 1 }
-        55 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableTextPrediction" 1 }
+        53 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableAutocorrection" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings\Hardware Keyboard" "EnableAutocorrection" 1
+        }
+        54 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableSpellchecking" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings\Hardware Keyboard" "EnableSpellchecking" 1
+        }
+        55 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings" "EnableTextPrediction" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Input\Settings\Hardware Keyboard" "EnableTextPrediction" 1
+        }
         56 {
             Set-Reg "HKCU:\Control Panel\Desktop" "WindowArrangementActive" "1" String
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapAssist" 1
@@ -1061,12 +1146,16 @@ function Register-DnsEnforcer($Primary, $Secondary, $Label) {
     # index renumbering on driver reinit, or a router/domain policy
     # re-asserting DNS at boot). Rather than diagnose which one applies here,
     # this reapplies the chosen DNS at every startup, running as SYSTEM so it
-    # works even before anyone logs in.
+    # works even before anyone logs in. Running as SYSTEM/ServiceAccount also
+    # means this executes in Session 0, isolated from the desktop - it was
+    # never able to show a visible window, unlike the AtLogOn tasks below.
     try {
         $taskName = "UIT63-DnsEnforcer"
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        $cmd = "Get-NetAdapter | Where-Object { `$_.Status -eq 'Up' } | ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex `$_.IfIndex -ServerAddresses ('$Primary','$Secondary') }"
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -Command `"$cmd`""
+        $innerCmd = "Get-NetAdapter | Where-Object { `$_.Status -eq 'Up' } | ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex `$_.IfIndex -ServerAddresses ('$Primary','$Secondary') }"
+        $fullCmd = "powershell.exe -NoProfile -WindowStyle Hidden -Command `"$innerCmd`""
+        $vbsPath = "$env:ProgramData\UIT63\DnsEnforcerLauncher.vbs"
+        $action = New-HiddenTaskAction $vbsPath $fullCmd
         $trigger = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal `
@@ -1193,6 +1282,72 @@ function Menu-InstallApps {
         Write-Host ""
         Install-SingleApp $lookup[$idNum]
         Read-Host "`nPress Enter to continue"
+    }
+}
+
+function Menu-Diagnostics {
+    while ($true) {
+        Show-Banner
+        Write-Host "  Diagnostics and Repair" -ForegroundColor White
+        Write-Host "  -----------------------" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  1. Memory Diagnostic (Windows Memory Diagnostic)"
+        Write-Host "  2. Disk Check - quick online scan (no restart needed)"
+        Write-Host "  3. Disk Check - full scan and fix (schedules for next restart)"
+        Write-Host "  4. System File Checker (sfc /scannow)"
+        Write-Host "  5. Component Store Repair (DISM RestoreHealth)"
+        Write-Host "  0. Back to main menu"
+        Write-Host ""
+        Write-Host "  These are standard, built-in Windows diagnostic tools - this menu just" -ForegroundColor DarkGray
+        Write-Host "  launches them for you rather than doing anything unusual under the hood." -ForegroundColor DarkGray
+        Write-Host ""
+        $sel = Read-Host "Select an option"
+        Write-Host ""
+        switch ($sel) {
+            '1' {
+                Write-Host "Opening Windows Memory Diagnostic. This requires a restart to actually" -ForegroundColor Cyan
+                Write-Host "run the test (it runs in a special pre-boot environment, similar to" -ForegroundColor Cyan
+                Write-Host "MemTest86) - choose 'Restart now' or 'Check on next restart' when prompted." -ForegroundColor Cyan
+                Start-Process "mdsched.exe"
+            }
+            '2' {
+                Write-Host "Running a quick online disk scan (report only, no changes made)..." -ForegroundColor Cyan
+                try {
+                    $result = Repair-Volume -DriveLetter ($env:SystemDrive.TrimEnd(':')) -Scan -ErrorAction Stop
+                    Write-Host "Scan result: $($result.HealthStatus)" -ForegroundColor Green
+                } catch {
+                    Write-Host "Scan failed: $($_.Exception.Message)" -ForegroundColor Red
+                }
+            }
+            '3' {
+                Write-Host "This will scan and fix errors, and requires a restart to run (the drive" -ForegroundColor Yellow
+                Write-Host "can't be locked while Windows is using it)." -ForegroundColor Yellow
+                $confirm = Read-Host "Schedule this for next restart? (Y/N)"
+                if ($confirm -match '^[Yy]') {
+                    try {
+                        Repair-Volume -DriveLetter ($env:SystemDrive.TrimEnd(':')) -OfflineScanAndFix -ErrorAction Stop
+                        Write-Host "Scheduled. It will run automatically on the next restart." -ForegroundColor Green
+                    } catch {
+                        Write-Host "Could not schedule: $($_.Exception.Message)" -ForegroundColor Red
+                    }
+                }
+            }
+            '4' {
+                Write-Host "Running System File Checker - this can take several minutes..." -ForegroundColor Cyan
+                sfc /scannow
+                Write-Host ""
+                Write-Host "If SFC reports corruption it could not fix, run option 5 (DISM) and then" -ForegroundColor DarkGray
+                Write-Host "try SFC again - DISM repairs the component store SFC repairs itself from." -ForegroundColor DarkGray
+            }
+            '5' {
+                Write-Host "Running DISM component store repair - this needs an internet connection" -ForegroundColor Cyan
+                Write-Host "and can take several minutes..." -ForegroundColor Cyan
+                DISM /Online /Cleanup-Image /RestoreHealth
+            }
+            '0' { return }
+            default { }
+        }
+        if ($sel -ne '0') { Read-Host "`nPress Enter to continue" }
     }
 }
 
@@ -1480,6 +1635,7 @@ try {
         Write-Host "  7. Restore to a previous save point"
         Write-Host "  8. Additional tweaks (optional)"
         Write-Host "  9. Install Windows Apps"
+        Write-Host "  D. Diagnostics and Repair (Memory, Disk, SFC, DISM)"
         Write-Host "  0. Exit"
         Write-Host ""
         $sel = Read-Host "Select an option"
@@ -1494,6 +1650,8 @@ try {
             '7' { Menu-Restore }
             '8' { Menu-AdditionalTweaks }
             '9' { Menu-InstallApps }
+            'D' { Menu-Diagnostics }
+            'd' { Menu-Diagnostics }
             '0' {
                 Stop-Transcript | Out-Null
                 Write-Host "`nExiting..." -ForegroundColor DarkGray

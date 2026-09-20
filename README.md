@@ -13,7 +13,7 @@ irm https://raw.githubusercontent.com/GTE2232/lab-tool/refs/heads/main/lab.ps1 |
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?style=flat-square&logo=windows)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE?style=flat-square&logo=powershell&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/version-1.0.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.1.0-blue?style=flat-square)
 ![Reversible](https://img.shields.io/badge/every%20tweak-reversible-blueviolet?style=flat-square)
 
 </div>
@@ -43,7 +43,7 @@ irm https://raw.githubusercontent.com/GTE2232/lab-tool/refs/heads/main/lab.ps1 |
 
 UIT-63 (FDIV Edition) is a single-file, self-elevating PowerShell tool that debloats and optimizes ageing Windows 10/11 machines. It was built for the hardware still common in institute computer labs — older Intel Core processors, 4GB RAM, and mechanical hard disk drives — but applies cleanly to any Windows 10/11 install that's slower than it should be.
 
-It applies a curated set of **reversible, operating-system-level changes** through a simple numbered menu: disabling unnecessary background services, trimming telemetry, tuning storage and memory behaviour, and removing bundled apps that serve no purpose on a coursework machine. Every change is logged and individually undoable.
+It applies a curated set of **reversible, operating-system-level changes** through a simple numbered menu: disabling unnecessary background services, trimming telemetry, tuning storage and memory behaviour, restoring Windows 7-era timing behaviour, and removing bundled apps that serve no purpose on a coursework machine — plus a built-in diagnostics menu for memory, disk, and system-file repair. Every change is logged and individually undoable.
 
 Rather than a one-shot script, it behaves like a small management console:
 
@@ -72,6 +72,7 @@ Rather than a one-shot script, it behaves like a small management console:
   7. Restore to a previous save point
   8. Additional tweaks (optional)
   9. Install Windows Apps
+  D. Diagnostics and Repair (Memory, Disk, SFC, DISM)
   0. Exit
 ```
 
@@ -165,6 +166,7 @@ Right-click the script and choose *Run with PowerShell* — it handles its own U
 | **7** | Restore to a Save Point | Roll the entire tweak configuration back to any previous automatic snapshot. |
 | **8** | Additional Tweaks | Photo Viewer restoration, DNS provider (Google/Cloudflare), Wi-Fi MAC randomization — applied individually, not in bulk. |
 | **9** | Install Windows Apps | Reinstall anything the tool removed, individually or all at once, via winget/Microsoft Store. |
+| **D** | Diagnostics and Repair | Launches Windows' own built-in tools: Memory Diagnostic, quick or full Disk Check, System File Checker, and DISM component-store repair. |
 | **0** | Exit | Closes the tool. |
 
 ---
@@ -270,6 +272,50 @@ Right-click the script and choose *Run with PowerShell* — it handles its own U
 
 </details>
 
+<details>
+<summary><strong>4.8 — Windows 7-Era Timing and Further Debloat</strong></summary>
+
+| Tweak | What it does and why |
+|---|---|
+| Global Timer Resolution (8ms, Windows 7-style) | Windows 10 changed the scheduler tick from a system-wide 1ms resolution (Windows 7's behaviour when any app requested it) to per-process only. This restores the global behaviour and holds it at 8ms via a small self-healing background process — see [Known Limitations](#known-limitations--faq) for how this is kept genuinely invisible. |
+| Compatibility Appraiser telemetry off | Disables `CompatTelRunner.exe`'s background app-inventory scans — a well-documented, frequent cause of unexplained CPU/disk spikes on older hardware that Windows 7 never had. |
+| OneDrive uninstalled | Removes OneDrive's constant background sync-checking, which Windows 7 never shipped with by default. |
+
+</details>
+
+<details>
+<summary><strong>4.9 — Search, Privacy, and Typing</strong></summary>
+
+| Tweak | What it does and why |
+|---|---|
+| Cloud content search off | Stops Windows Search from querying OneDrive/work-account content online. |
+| SafeSearch off | Turns off adult-content filtering in local search results. |
+| Search history off | Stops Windows from remembering device search history for suggestions. |
+| Inking & typing personalization off | Stops collection of handwriting/typing data used to personalize suggestions. |
+| Locally relevant content via language list off | Stops websites from reading your language list to localize content. |
+| Game Bar off | Disables the Xbox Game Bar overlay and its background capture service. |
+| Copilot uninstalled | Attempts removal across all known package names Microsoft has used for Copilot; on some Windows 11 builds it's a protected inbox component and can't be fully removed — the tool says so honestly rather than claiming success, and disables the taskbar button either way. |
+| Cortana leftover cleanup | Removes small leftover shortcut files (~8KB) from a previous Cortana removal — cosmetic, not a resource fix. |
+| Autocorrect / spell-highlight / text suggestions off | Disables the three separate physical-keyboard typing-assistance features under Settings → Typing. |
+| Multitasking (Snap) off | Disables the window-snapping arrangement features under Settings → System → Multitasking. |
+
+</details>
+
+<details>
+<summary><strong>4.10 — Diagnostics and Repair (Option D)</strong></summary>
+
+Not tweaks — these launch Windows' own built-in diagnostic tools directly, nothing custom under the hood.
+
+| Tool | What it does |
+|---|---|
+| Memory Diagnostic | Opens `mdsched.exe`; schedules a restart-based RAM test, similar to MemTest86. |
+| Disk Check — quick scan | Online, read-only volume health scan via `Repair-Volume -Scan`, no restart needed. |
+| Disk Check — full scan and fix | Schedules an offline scan-and-fix for the next restart. |
+| System File Checker | Runs `sfc /scannow`. |
+| Component Store Repair | Runs `DISM /Online /Cleanup-Image /RestoreHealth` — pairs well with SFC if corruption is found that SFC alone can't fix. |
+
+</details>
+
 ---
 
 ## Running It Safely
@@ -321,6 +367,12 @@ On some hardware, interface index renumbering (or a router/domain policy) can re
 
 **Is Storage Sense off actually a good idea?**
 It's a documented trade-off, not a strict win — disabling it removes a background disk-scanning source, but on an HDD genuinely short on space, Storage Sense's automatic cleanup can be more helpful than harmful. Judge by your actual disk headroom.
+
+**A PowerShell window pops up briefly every time the PC starts — is that expected?**
+No — that was a real bug in earlier versions. A few background self-healing tasks (font smoothing, timer resolution) launch at logon, and `-WindowStyle Hidden` on `powershell.exe` is unreliable specifically when Windows Terminal is set as the default terminal app — it can still flash a visible window. Fixed by routing these through a `WScript.Shell.Run` wrapper (window style `0`), which hides the window at the OS level regardless of terminal settings. If you installed a version before this fix, re-running the relevant tweak (Option 5, or re-applying via Option 1) replaces the old scheduled task with the corrected one.
+
+**Copilot won't fully uninstall / still shows disk usage — why?**
+On some Windows 11 builds, Copilot is a protected inbox component rather than a normal removable app, and no script can override that. The tool tries every known package name Microsoft has used across builds and disables the taskbar button either way, but tells you plainly if full removal wasn't possible rather than claiming success it can't verify.
 
 ---
 

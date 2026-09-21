@@ -1169,6 +1169,21 @@ function Remove-DnsEnforcer {
     try { Unregister-ScheduledTask -TaskName "UIT63-DnsEnforcer" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
 }
 
+function Remove-AllUit63Tasks {
+    # Full cleanup of every background scheduled task this tool has ever
+    # registered, across any version - the escape hatch for someone who
+    # doesn't remember which specific tweak to re-toggle after an update.
+    try { Remove-TimerResolutionEnforcer } catch {}
+    try { Remove-DnsEnforcer } catch {}
+    try { Unregister-ScheduledTask -TaskName "UIT63-FontSmoothingEnforcer" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    # Catch-all sweep in case a task name changed across versions or isn't covered above
+    try {
+        Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "UIT63-*" } | ForEach-Object {
+            Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
 function Set-DnsProvider($Primary, $Secondary, $Label) {
     $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
     if (-not $adapters) { Write-Host "  No active network adapter found." -ForegroundColor DarkGray; return }
@@ -1296,6 +1311,7 @@ function Menu-Diagnostics {
         Write-Host "  3. Disk Check - full scan and fix (schedules for next restart)"
         Write-Host "  4. System File Checker (sfc /scannow)"
         Write-Host "  5. Component Store Repair (DISM RestoreHealth)"
+        Write-Host "  6. Remove leftover UIT-63 scheduled tasks (cleanup from older versions)"
         Write-Host "  0. Back to main menu"
         Write-Host ""
         Write-Host "  These are standard, built-in Windows diagnostic tools - this menu just" -ForegroundColor DarkGray
@@ -1343,6 +1359,18 @@ function Menu-Diagnostics {
                 Write-Host "Running DISM component store repair - this needs an internet connection" -ForegroundColor Cyan
                 Write-Host "and can take several minutes..." -ForegroundColor Cyan
                 DISM /Online /Cleanup-Image /RestoreHealth
+            }
+            '6' {
+                Write-Host "This removes any leftover UIT-63 background scheduled tasks - including" -ForegroundColor Yellow
+                Write-Host "ones registered by an older, buggy version of this script that could show" -ForegroundColor Yellow
+                Write-Host "a visible PowerShell window at every boot. Tweaks that depend on these" -ForegroundColor Yellow
+                Write-Host "(Global Timer Resolution, font smoothing enforcement, DNS enforcement)" -ForegroundColor Yellow
+                Write-Host "will stop self-healing until you re-toggle them from the main menu." -ForegroundColor Yellow
+                $confirm = Read-Host "Continue? (Y/N)"
+                if ($confirm -match '^[Yy]') {
+                    Remove-AllUit63Tasks
+                    Write-Host "Done. Old scheduled tasks and their background processes have been removed." -ForegroundColor Green
+                }
             }
             '0' { return }
             default { }

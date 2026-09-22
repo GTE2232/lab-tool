@@ -153,8 +153,12 @@ function Start-Hidden($InnerCommandLine) {
     $escaped = $InnerCommandLine -replace '"', '""'
     $vbs = "Set objShell = CreateObject(`"WScript.Shell`")`r`nobjShell.Run `"$escaped`", 0, False"
     Set-Content -Path $vbsPath -Value $vbs -Encoding ASCII
-    Start-Process wscript.exe -ArgumentList "`"$vbsPath`"" -WindowStyle Hidden
-    Start-Sleep -Milliseconds 300
+    $wscriptProc = Start-Process wscript.exe -ArgumentList "`"$vbsPath`"" -WindowStyle Hidden -PassThru
+    # Wait for wscript's own process to exit (it returns almost immediately
+    # after firing the non-blocking Run call) rather than a fixed sleep -
+    # more reliable on slow disk I/O where a fixed delay can race the file read.
+    if ($wscriptProc) { $wscriptProc | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 500
     Remove-Item $vbsPath -Force -ErrorAction SilentlyContinue
 }
 
@@ -176,16 +180,32 @@ $TimerResTask = "UIT63-TimerResolutionEnforcer"
 
 function Install-TimerResolutionEnforcer {
     if (-not (Test-Path $TimerResDir)) { New-Item -Path $TimerResDir -ItemType Directory -Force | Out-Null }
-    $body = @'
-$PID | Out-File -FilePath "__PIDFILE__" -Encoding ascii -Force
-Add-Type -Namespace UIT63 -Name Winmm -MemberDefinition @"
+
+    # Compile the P/Invoke helper ONCE to a real .dll, rather than having the
+    # enforcer script recompile C# from source via Add-Type on every single
+    # launch (every logon). That compilation step is genuinely slow on older
+    # hardware - this was very likely the actual cause of "could not confirm
+    # the process started": it hadn't finished compiling yet, not that it failed.
+    $dllPath = "$TimerResDir\UIT63TimerHelper.dll"
+    if (-not (Test-Path $dllPath)) {
+        try {
+            Add-Type -Namespace UIT63 -Name Winmm -MemberDefinition @"
 [DllImport("winmm.dll")]
 public static extern uint timeBeginPeriod(uint uMilliseconds);
-"@
+"@ -OutputAssembly $dllPath -OutputType Library -ErrorAction Stop
+        } catch {
+            Write-Host "  Could not pre-compile the timer helper: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
+    }
+
+    $body = @'
+$PID | Out-File -FilePath "__PIDFILE__" -Encoding ascii -Force
+Add-Type -Path "__DLLPATH__"
 [UIT63.Winmm]::timeBeginPeriod(8) | Out-Null
 while ($true) { Start-Sleep -Seconds 3600 }
 '@
     $body = $body -replace '__PIDFILE__', $TimerResPidFile
+    $body = $body -replace '__DLLPATH__', $dllPath
     Set-Content -Path $TimerResScript -Value $body -Encoding UTF8
 
     # Stop any previous instance tracked by the PID file before starting fresh
@@ -199,16 +219,23 @@ while ($true) { Start-Sleep -Seconds 3600 }
     # under Windows Terminal) - the script writes its own PID to the pid file
     # as its first action, so tracking works the same way whether launched
     # here or by the scheduled task below.
-    Start-Hidden "powershell.exe -NoProfile -WindowStyle Hidden -File `"$TimerResScript`""
-    Start-Sleep -Milliseconds 800
-    if (-not (Test-Path $TimerResPidFile)) {
-        Write-Host "  Could not confirm the timer resolution process started." -ForegroundColor DarkYellow
+    Start-Hidden "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TimerResScript`""
+    # Poll rather than a single fixed-delay check - loading a pre-built DLL is
+    # fast, but still give this a reasonable window on slow HDD-based hardware.
+    $confirmed = $false
+    for ($i = 0; $i -lt 10; $i++) {
+        Start-Sleep -Seconds 1
+        if (Test-Path $TimerResPidFile) { $confirmed = $true; break }
+    }
+    if (-not $confirmed) {
+        Write-Host "  Could not confirm the timer resolution process started after 10 seconds." -ForegroundColor DarkYellow
+        Write-Host "  Check status again shortly - on slower hardware it can still finish starting." -ForegroundColor DarkYellow
     }
 
     try {
         Unregister-ScheduledTask -TaskName $TimerResTask -Confirm:$false -ErrorAction SilentlyContinue
         $vbsPath = "$TimerResDir\TimerResLauncher.vbs"
-        $action = New-HiddenTaskAction $vbsPath "powershell.exe -NoProfile -WindowStyle Hidden -File `"$TimerResScript`""
+        $action = New-HiddenTaskAction $vbsPath "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TimerResScript`""
         $trigger = New-ScheduledTaskTrigger -AtLogOn
         Register-ScheduledTask -TaskName $TimerResTask -Action $action -Trigger $trigger `
             -Description "UIT-63 FDIV: holds an 8ms Windows 7-style global timer resolution" -Force | Out-Null
@@ -462,6 +489,7 @@ function Test-TweakApplied($Id) {
             $onedrivePaths = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe", "$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
             $present = $false
             foreach ($p in $onedrivePaths) { if (Test-Path $p) { $present = $true } }
+            if (Get-OneDriveUninstallString) { $present = $true }
             return (-not $present) -and (-not (Get-Process OneDrive -ErrorAction SilentlyContinue))
         }
         45 {
@@ -655,13 +683,66 @@ function Enable-Tweak($Id) {
         }
         43 { Set-TaskState "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" $true }
         44 {
-            $paths = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe", "$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
             Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            foreach ($path in $paths) {
-                if (Test-Path $path) {
-                    try { Start-Process $path -ArgumentList "/uninstall" -Wait -ErrorAction Stop }
-                    catch { Write-Host "  OneDrive uninstall failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+            $triggered = $false
+
+            $uninstallStr = Get-OneDriveUninstallString
+            if ($uninstallStr) {
+                try {
+                    if ($uninstallStr -match '^"([^"]+)"\s*(.*)$') {
+                        $exe = $Matches[1]; $exeArgs = $Matches[2]
+                    } else {
+                        $parts = $uninstallStr -split ' ', 2
+                        $exe = $parts[0]; $exeArgs = if ($parts.Count -gt 1) { $parts[1] } else { "" }
+                    }
+                    if ($exeArgs -notmatch '/uninstall') { $exeArgs = "$exeArgs /uninstall".Trim() }
+                    Start-Process $exe -ArgumentList $exeArgs -ErrorAction Stop
+                    $triggered = $true
+                } catch {
+                    Write-Host "  Could not run the registered OneDrive uninstaller: $($_.Exception.Message)" -ForegroundColor DarkYellow
                 }
+            }
+
+            if (-not $triggered) {
+                # Fallback: no registry uninstall entry found, try known common paths
+                $paths = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe", "$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
+                foreach ($path in $paths) {
+                    if (Test-Path $path) {
+                        # No -Wait: OneDriveSetup.exe /uninstall hands off to a detached
+                        # child process and returns almost immediately - waiting on the
+                        # parent doesn't actually wait for the uninstall to finish.
+                        try { Start-Process $path -ArgumentList "/uninstall" -ErrorAction Stop; $triggered = $true }
+                        catch { Write-Host "  OneDrive uninstall failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+                    }
+                }
+            }
+
+            if ($triggered) {
+                Write-Host "  Waiting for OneDrive's uninstaller to finish..." -ForegroundColor DarkGray
+                Start-Sleep -Seconds 8
+            } else {
+                Write-Host "  Could not find any OneDrive uninstaller (registry or known paths) - it may already be removed, or installed in an unrecognized location." -ForegroundColor DarkYellow
+            }
+            Get-Process OneDriveSetup -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+            # The uninstaller's own self-cleanup is known to behave inconsistently
+            # when launched from an elevated context (which this tool always runs
+            # in). Rather than trust that it finished, force-remove what's left
+            # directly - we already have the rights to do this reliably.
+            $leftoverPaths = @(
+                "$env:LOCALAPPDATA\Microsoft\OneDrive",
+                "$env:ProgramData\Microsoft OneDrive",
+                "$env:SystemDrive\OneDriveTemp"
+            )
+            foreach ($lp in $leftoverPaths) {
+                if (Test-Path $lp) {
+                    try { Remove-Item -Path $lp -Recurse -Force -ErrorAction Stop }
+                    catch { Write-Host "  Could not remove $lp - it may still be in use; a restart may clear it." -ForegroundColor DarkYellow }
+                }
+            }
+            Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "OneDrive*" } | ForEach-Object {
+                Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
             }
         }
         45 {
@@ -1182,6 +1263,24 @@ function Remove-AllUit63Tasks {
             Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
         }
     } catch {}
+}
+
+function Get-OneDriveUninstallString {
+    # Reads Windows' own registered uninstall command for OneDrive - the same
+    # place Control Panel's "Uninstall a program" reads from. More reliable
+    # than guessing install paths, since Microsoft has changed OneDrive's
+    # install location and packaging more than once over the years.
+    $searchPaths = @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    foreach ($path in $searchPaths) {
+        $entry = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like "*OneDrive*" } | Select-Object -First 1
+        if ($entry -and $entry.UninstallString) { return $entry.UninstallString }
+    }
+    return $null
 }
 
 function Set-DnsProvider($Primary, $Secondary, $Label) {

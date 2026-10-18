@@ -1,4 +1,3 @@
-# =========================================================== 
 # UIT-63 - FDIV Edition | PC Fallback Optimizer made by shivansh 
 # =========================================================== 
 # Target: Windows 10, low-RAM education lab machines (i5 2nd gen / 4GB DDR3 1600MHz / mechanical HDD) 
@@ -13,6 +12,7 @@ $Author   = "shivansh"
 # "irm | iex" has no file on disk, so self-elevation can't just relaunch a
 # file path - it needs to re-download and re-run itself in the new window.
 $ScriptUrl = "PUT_YOUR_RAW_SCRIPT_URL_HERE"
+
 
 # ---- Self-elevate if not running as Administrator ----
 # (Right-click "Run with PowerShell" does NOT run elevated, and closes the
@@ -181,31 +181,49 @@ $TimerResTask = "UIT63-TimerResolutionEnforcer"
 function Install-TimerResolutionEnforcer {
     if (-not (Test-Path $TimerResDir)) { New-Item -Path $TimerResDir -ItemType Directory -Force | Out-Null }
 
-    # Compile the P/Invoke helper ONCE to a real .dll, rather than having the
-    # enforcer script recompile C# from source via Add-Type on every single
-    # launch (every logon). That compilation step is genuinely slow on older
-    # hardware - this was very likely the actual cause of "could not confirm
-    # the process started": it hadn't finished compiling yet, not that it failed.
-    $dllPath = "$TimerResDir\UIT63TimerHelper.dll"
-    if (-not (Test-Path $dllPath)) {
-        try {
-            Add-Type -Namespace UIT63 -Name Winmm -MemberDefinition @"
+    # Compile the P/Invoke helper ONCE to a real .dll, rather than recompiling
+    # C# via Add-Type on every launch (every logon) - that compilation is slow
+    # on older hardware. If the DLL can't be built, the enforcer script falls
+    # back to compiling the same member definition inline.
+    #
+    # SetProcessInformation is the Windows 11 part: from Windows 11 on, a
+    # process whose window is hidden/occluded stops being guaranteed a high
+    # timer resolution. This process is exactly that (a hidden window), so it
+    # opts out of that behaviour (power-throttling class 4, IGNORE_TIMER_RESOLUTION
+    # control bit set, state bit clear). On Windows 10 the call is simply
+    # ignored. The "2" in the file name is so an older cached DLL without
+    # this method is never reused.
+    $memberDef = @'
 [DllImport("winmm.dll")]
 public static extern uint timeBeginPeriod(uint uMilliseconds);
-"@ -OutputAssembly $dllPath -OutputType Library -ErrorAction Stop
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetProcessInformation(IntPtr hProcess, int ProcessInformationClass, uint[] ProcessInformation, int ProcessInformationSize);
+'@
+    $dllPath = "$TimerResDir\UIT63TimerHelper2.dll"
+    if (-not (Test-Path $dllPath)) {
+        try {
+            Add-Type -Namespace UIT63 -Name Winmm -MemberDefinition $memberDef -OutputAssembly $dllPath -OutputType Library -ErrorAction Stop
         } catch {
-            Write-Host "  Could not pre-compile the timer helper: $($_.Exception.Message)" -ForegroundColor DarkYellow
+            Write-Host "  Could not pre-build the timer helper ($($_.Exception.Message)) - it will compile on launch instead." -ForegroundColor DarkYellow
         }
     }
 
     $body = @'
 $PID | Out-File -FilePath "__PIDFILE__" -Encoding ascii -Force
-Add-Type -Path "__DLLPATH__"
+if (Test-Path "__DLLPATH__") {
+    Add-Type -Path "__DLLPATH__"
+} else {
+Add-Type -Namespace UIT63 -Name Winmm -MemberDefinition @"
+__MEMBERDEF__
+"@
+}
+try { [UIT63.Winmm]::SetProcessInformation((Get-Process -Id $PID).Handle, 4, [uint32[]](1,4,0), 12) | Out-Null } catch {}
 [UIT63.Winmm]::timeBeginPeriod(8) | Out-Null
 while ($true) { Start-Sleep -Seconds 3600 }
 '@
     $body = $body -replace '__PIDFILE__', $TimerResPidFile
     $body = $body -replace '__DLLPATH__', $dllPath
+    $body = $body -replace '__MEMBERDEF__', $memberDef
     Set-Content -Path $TimerResScript -Value $body -Encoding UTF8
 
     # Stop any previous instance tracked by the PID file before starting fresh
@@ -258,7 +276,8 @@ function Test-TimerResolutionEnforcerRunning {
     $storedPid = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue
     if (-not $storedPid) { return $false }
     $proc = Get-Process -Id $storedPid -ErrorAction SilentlyContinue
-    return [bool]$proc
+    # Guard against a recycled PID: it must still be a PowerShell process
+    return [bool]($proc -and ($proc.ProcessName -like 'powershell*'))
 }
 
 # P/Invoke for individual visual-effect toggles (SystemParametersInfo)
@@ -337,6 +356,19 @@ function Ensure-Winget {
     return $false
 }
 
+# ===========================================================
+# WINDOWS GENERATION DETECTION (silent - no prompt)
+# Windows 11 still reports version 10.0, so the build number is the
+# reliable discriminator: build 22000 and above is Windows 11. Everything
+# below that depends on the OS (tweak catalog, app list, messages) reads
+# these three values.
+# ===========================================================
+$Global:WinBuild = 0
+try { $Global:WinBuild = [int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).BuildNumber } catch {}
+if (-not $Global:WinBuild) { $Global:WinBuild = [System.Environment]::OSVersion.Version.Build }
+$Global:IsWin11 = ($Global:WinBuild -ge 22000)
+$Global:OSLabel = if ($Global:IsWin11) { "Windows 11" } else { "Windows 10" }
+
 $hvciPath = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
 $HighPerfGuid = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
 $BundledApps = @(
@@ -353,9 +385,63 @@ $BundledApps = @(
     "Microsoft.Todos","Microsoft.Wallet","Microsoft.Whiteboard","Microsoft.WindowsAlarms",
     "microsoft.windowscommunicationsapps","Microsoft.WindowsFeedbackHub","Microsoft.WindowsMaps",
     "Microsoft.WindowsSoundRecorder","Microsoft.ZuneMusic","Microsoft.ZuneVideo","Microsoft.YourPhone",
-    "Microsoft.Copilot","Microsoft.MicrosoftStickyNotes","Microsoft.MixedReality.Portal"
+    "Microsoft.Copilot","Microsoft.MicrosoftStickyNotes","Microsoft.MixedReality.Portal",
+    "Microsoft.549981C3F5F10"
 )
+# Apps that only exist on one generation - the removal chain skips absent
+# packages harmlessly, but keeping the lists separate keeps Option 9 accurate.
+$BundledAppsWin11 = @("MicrosoftWindows.Client.WebExperience","Microsoft.Windows.DevHome","Microsoft.PowerAutomateDesktop","Microsoft.BingSearch")
+$BundledAppsWin10 = @("Microsoft.MSPaint")
+if ($Global:IsWin11) { $BundledApps = $BundledApps + $BundledAppsWin11 } else { $BundledApps = $BundledApps + $BundledAppsWin10 }
 $XboxServices = @('XblAuthManager','XblGameSave','XboxNetApiSvc','XboxGipSvc')
+
+# ---- Shared data for the newer tweaks ----
+$CdmPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+$CdmValues = @(
+    "ContentDeliveryAllowed","OemPreInstalledAppsEnabled","PreInstalledAppsEnabled","PreInstalledAppsEverEnabled",
+    "SilentInstalledAppsEnabled","SystemPaneSuggestionsEnabled","SoftLandingEnabled",
+    "RotatingLockScreenEnabled","RotatingLockScreenOverlayEnabled",
+    "SubscribedContent-310093Enabled","SubscribedContent-338387Enabled","SubscribedContent-338388Enabled",
+    "SubscribedContent-338389Enabled","SubscribedContent-338393Enabled","SubscribedContent-353694Enabled",
+    "SubscribedContent-353696Enabled","SubscribedContent-353698Enabled"
+)
+$TelemetryTasks = @(
+    @("\Microsoft\Windows\Customer Experience Improvement Program\", "Consolidator"),
+    @("\Microsoft\Windows\Customer Experience Improvement Program\", "UsbCeip"),
+    @("\Microsoft\Windows\Customer Experience Improvement Program\", "KernelCeipTask"),
+    @("\Microsoft\Windows\Application Experience\", "ProgramDataUpdater"),
+    @("\Microsoft\Windows\Feedback\Siuf\", "DmClient"),
+    @("\Microsoft\Windows\Feedback\Siuf\", "DmClientOnScenarioDownload"),
+    @("\Microsoft\Windows\DiskDiagnostic\", "Microsoft-Windows-DiskDiagnosticDataCollector")
+)
+$CtxMenuRoot = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
+$CtxMenuKey = "$CtxMenuRoot\InprocServer32"
+
+function Set-HighPerformancePlan {
+    # Some installs (many Windows 11 and modern-standby systems) hide the High
+    # performance plan entirely. Recreate it under its standard GUID if missing.
+    $list = powercfg /list 2>$null | Out-String
+    if ($list -notmatch $HighPerfGuid) {
+        powercfg -duplicatescheme $HighPerfGuid $HighPerfGuid 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { powercfg -duplicatescheme $HighPerfGuid 2>$null | Out-Null }
+    }
+    powercfg /setactive $HighPerfGuid 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        $m = [regex]::Match((powercfg /list | Out-String), '([0-9a-fA-F-]{36})\s+\((High performance|Ultimate Performance)\)')
+        if ($m.Success) { powercfg /setactive $m.Groups[1].Value 2>$null }
+    }
+}
+
+function Test-OneDriveInstalled {
+    # Deliberately does NOT look at SysWOW64\OneDriveSetup.exe - that installer
+    # stub ships with Windows itself and stays after an uninstall, so counting
+    # it made this tweak report "not applied" forever.
+    $exes = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe", "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe", "${env:ProgramFiles(x86)}\Microsoft OneDrive\OneDrive.exe")
+    foreach ($e in $exes) { if ($e -and (Test-Path $e)) { return $true } }
+    if (Get-OneDriveUninstallString) { return $true }
+    if (Get-Process OneDrive -ErrorAction SilentlyContinue) { return $true }
+    return $false
+}
 
 # ===========================================================
 # TWEAK CATALOG  (Id -> Name / Tier)
@@ -375,11 +461,11 @@ $TweakInfo = @{
     11 = @{ Name = "Feedback frequency - Never";                  Tier = "Base" }
     12 = @{ Name = "Activity History - off";                      Tier = "Base" }
     13 = @{ Name = "Activity Upload - off";                       Tier = "Base" }
-    14 = @{ Name = "Diagnostic data - Basic";                     Tier = "Base" }
+    14 = @{ Name = $(if ($Global:IsWin11) { "Diagnostic data - Required (minimum)" } else { "Diagnostic data - Basic" }); Tier = "Base" }
     15 = @{ Name = "Advertising ID - off";                        Tier = "Base" }
     16 = @{ Name = "Tailored experiences - off";                  Tier = "Base" }
     17 = @{ Name = "Windows Copilot - off";                       Tier = "Base" }
-    18 = @{ Name = "Cortana - off";                                Tier = "Base" }
+    18 = @{ Name = "Cortana - off"; Tier = "Base"; OS = "10" }
     19 = @{ Name = "Storage Sense - off";                          Tier = "Base" }
     20 = @{ Name = "Memory Integrity / Core Isolation - off";     Tier = "Base" }
     21 = @{ Name = "Background apps - off";                       Tier = "Base" }
@@ -413,11 +499,40 @@ $TweakInfo = @{
     49 = @{ Name = "Locally relevant content via language list - off"; Tier = "Base" }
     50 = @{ Name = "Game Bar - off"; Tier = "Base" }
     51 = @{ Name = "Copilot app - uninstalled"; Tier = "Base" }
-    52 = @{ Name = "Cortana leftover shortcuts - cleaned up"; Tier = "Base" }
+    52 = @{ Name = "Cortana leftover shortcuts - cleaned up"; Tier = "Base"; OS = "10" }
     53 = @{ Name = "Autocorrect misspelled words - off"; Tier = "Base" }
     54 = @{ Name = "Highlight misspelled words - off"; Tier = "Base" }
     55 = @{ Name = "Show text suggestions - off"; Tier = "Base" }
     56 = @{ Name = "Multitasking (Snap) - off"; Tier = "Base" }
+    57 = @{ Name = "Sponsored suggestions, tips and silent app installs - off"; Tier = "Base" }
+    58 = @{ Name = "Snappier menus and faster app-close at shutdown"; Tier = "Base" }
+    59 = @{ Name = "Taskbar animations and Aero Peek - off"; Tier = "Base" }
+    60 = @{ Name = "Game Mode - off"; Tier = "Base" }
+    61 = @{ Name = "Edge background mode, sidebar and shopping - off"; Tier = "Base" }
+    62 = @{ Name = "Explorer opens to This PC; recent/frequent items off"; Tier = "Base" }
+    63 = @{ Name = "CEIP, feedback and disk-diagnostic telemetry tasks - off"; Tier = "Base" }
+    64 = @{ Name = "Windows Error Reporting - off"; Tier = "Base" }
+    65 = @{ Name = "Settings sync - off"; Tier = "Base" }
+    66 = @{ Name = "News and Interests taskbar feed - off"; Tier = "Base"; OS = "10" }
+    67 = @{ Name = "Taskbar clutter off (Cortana/People/Meet Now/Task View)"; Tier = "Base"; OS = "10" }
+    68 = @{ Name = "Windows Ink Workspace - off"; Tier = "Base"; OS = "10" }
+    69 = @{ Name = "Widgets - off"; Tier = "Base"; OS = "11" }
+    70 = @{ Name = "Chat (Teams) taskbar icon - off"; Tier = "Base"; OS = "11" }
+    71 = @{ Name = "Taskbar Task View button and Search box - hidden"; Tier = "Base"; OS = "11" }
+    72 = @{ Name = "Classic right-click context menu restored"; Tier = "Base"; OS = "11" }
+    73 = @{ Name = "Start menu recommendations and tracking - off"; Tier = "Base"; OS = "11" }
+    74 = @{ Name = "Recall / AI snapshot policy - off"; Tier = "Base"; OS = "11" }
+}
+
+# Drop tweaks that don't apply to the Windows generation this machine is
+# running. Every menu, bulk action, status list and save point iterates
+# $TweakInfo, so removing entries here is all that's needed - no other code
+# has to know about the OS split. Ids stay stable across generations.
+foreach ($k in @($TweakInfo.Keys)) {
+    $req = $TweakInfo[$k].OS
+    if ($req -and ((($req -eq "11") -and (-not $Global:IsWin11)) -or (($req -eq "10") -and $Global:IsWin11))) {
+        $TweakInfo.Remove($k)
+    }
 }
 
 # ===========================================================
@@ -446,7 +561,7 @@ function Test-TweakApplied($Id) {
         19 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy" "01") -eq 0 }
         20 { return (Get-RegValue $hvciPath "Enabled") -eq 0 }
         21 { return (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsRunInBackground") -eq 2 }
-        22 { $a = powercfg /getactivescheme; return ($a -match $HighPerfGuid) }
+        22 { $a = powercfg /getactivescheme | Out-String; return (($a -match $HighPerfGuid) -or ($a -match 'High performance|Ultimate Performance')) }
         23 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting") -eq 3 }
         24 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency") -eq 0 }
         25 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "IconsOnly") -eq 1 }
@@ -485,13 +600,7 @@ function Test-TweakApplied($Id) {
             return $regOk -and (Test-TimerResolutionEnforcerRunning)
         }
         43 { return Get-TaskDisabled "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" }
-        44 {
-            $onedrivePaths = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe", "$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
-            $present = $false
-            foreach ($p in $onedrivePaths) { if (Test-Path $p) { $present = $true } }
-            if (Get-OneDriveUninstallString) { $present = $true }
-            return (-not $present) -and (-not (Get-Process OneDrive -ErrorAction SilentlyContinue))
-        }
+        44 { return (-not (Test-OneDriveInstalled)) }
         45 {
             return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsMSACloudSearchEnabled") -eq 0 -and
                    (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsAADCloudSearchEnabled") -eq 0
@@ -530,6 +639,73 @@ function Test-TweakApplied($Id) {
             return ($v1 -eq 0) -or ($v2 -eq 0)
         }
         56 { return (Get-RegValue "HKCU:\Control Panel\Desktop" "WindowArrangementActive") -eq "0" }
+        57 {
+            return ((Get-RegValue $CdmPath "SilentInstalledAppsEnabled") -eq 0) -and
+                   ((Get-RegValue $CdmPath "SystemPaneSuggestionsEnabled") -eq 0) -and
+                   ((Get-RegValue $CdmPath "SubscribedContent-338388Enabled") -eq 0)
+        }
+        58 {
+            return ((Get-RegValue "HKCU:\Control Panel\Desktop" "MenuShowDelay") -eq "100") -and
+                   ((Get-RegValue "HKCU:\Control Panel\Desktop" "WaitToKillAppTimeout") -eq "3000")
+        }
+        59 {
+            return ((Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAnimations") -eq 0) -and
+                   ((Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\DWM" "EnableAeroPeek") -eq 0)
+        }
+        60 {
+            return ((Get-RegValue "HKCU:\SOFTWARE\Microsoft\GameBar" "AutoGameModeEnabled") -eq 0) -and
+                   ((Get-RegValue "HKCU:\SOFTWARE\Microsoft\GameBar" "AllowAutoGameMode") -eq 0)
+        }
+        61 {
+            $ep = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
+            return ((Get-RegValue $ep "BackgroundModeEnabled") -eq 0) -and
+                   ((Get-RegValue $ep "HubsSidebarEnabled") -eq 0) -and
+                   ((Get-RegValue $ep "EdgeShoppingAssistantEnabled") -eq 0)
+        }
+        62 {
+            $adv = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            $exp = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer"
+            return ((Get-RegValue $adv "LaunchTo") -eq 1) -and
+                   ((Get-RegValue $exp "ShowRecent") -eq 0) -and
+                   ((Get-RegValue $exp "ShowFrequent") -eq 0)
+        }
+        63 {
+            $allOff = $true
+            foreach ($t in $TelemetryTasks) { if (-not (Get-TaskDisabled $t[0] $t[1])) { $allOff = $false } }
+            return $allOff
+        }
+        64 { return (Get-RegValue "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" "Disabled") -eq 1 }
+        65 { return (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SettingSync" "DisableSettingSync") -eq 2 }
+        66 {
+            $polOff = (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds" "EnableFeeds") -eq 0
+            $modeOff = (Get-RegValue "HKCU:\Software\Microsoft\Windows\CurrentVersion\Feeds" "ShellFeedsTaskbarViewMode") -eq 2
+            return ($polOff -or $modeOff)
+        }
+        67 {
+            $adv = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            return ((Get-RegValue $adv "ShowTaskViewButton") -eq 0) -and ((Get-RegValue $adv "ShowCortanaButton") -eq 0)
+        }
+        68 { return (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\WindowsInkWorkspace" "AllowWindowsInkWorkspace") -eq 0 }
+        69 {
+            $polOff = (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests") -eq 0
+            $btnOff = (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa") -eq 0
+            return ($polOff -or $btnOff)
+        }
+        70 {
+            $polOff = (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat" "ChatIcon") -eq 3
+            $btnOff = (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn") -eq 0
+            return ($polOff -or $btnOff)
+        }
+        71 {
+            return ((Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton") -eq 0) -and
+                   ((Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode") -eq 0)
+        }
+        72 { return (Test-Path -LiteralPath $CtxMenuKey) }
+        73 {
+            $adv = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            return ((Get-RegValue $adv "Start_TrackDocs") -eq 0) -and ((Get-RegValue $adv "Start_IrisRecommendations") -eq 0)
+        }
+        74 { return (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis") -eq 1 }
     }
     return $false
 }
@@ -566,7 +742,7 @@ function Enable-Tweak($Id) {
         19 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy" "01" 0 }
         20 { Set-Reg $hvciPath "Enabled" 0 }
         21 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsRunInBackground" 2 }
-        22 { powercfg /setactive SCHEME_MIN }
+        22 { Set-HighPerformancePlan }
         23 {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting" 3
             Set-Reg "HKCU:\Control Panel\Desktop" "FontSmoothing" "2" String
@@ -679,7 +855,11 @@ function Enable-Tweak($Id) {
         42 {
             Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel" "GlobalTimerResolutionRequests" 1
             Install-TimerResolutionEnforcer
-            Write-Host "  Global timer resolution restored to Windows 7-style behavior, held at 8ms." -ForegroundColor Green
+            if ((-not $Global:IsWin11) -and ($Global:WinBuild -lt 19041)) {
+                Write-Host "  Held at 8ms. This Windows 10 build predates version 2004, where timer resolution is already system-wide." -ForegroundColor Green
+            } else {
+                Write-Host "  Global timer resolution restored to Windows 7-style behavior, held at 8ms." -ForegroundColor Green
+            }
         }
         43 { Set-TaskState "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" $true }
         44 {
@@ -744,6 +924,8 @@ function Enable-Tweak($Id) {
             Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "OneDrive*" } | ForEach-Object {
                 Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
             }
+            # Also stop OneDrive from running for any other (or future) profile on this PC
+            Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" 1
         }
         45 {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsMSACloudSearchEnabled" 0
@@ -760,6 +942,7 @@ function Enable-Tweak($Id) {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
             Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
             Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\GameBar" "UseNexusForGameBarEnabled" 0
         }
         51 {
             $names = @("Microsoft.Copilot", "Microsoft.Windows.Copilot", "MicrosoftWindows.Client.CoPilot")
@@ -809,6 +992,82 @@ function Enable-Tweak($Id) {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapAssist" 0
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapFill" 0
         }
+        57 {
+            foreach ($n in $CdmValues) { Set-Reg $CdmPath $n 0 }
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
+            Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" 1
+        }
+        58 {
+            Set-Reg "HKCU:\Control Panel\Desktop" "MenuShowDelay" "100" String
+            Set-Reg "HKCU:\Control Panel\Desktop" "WaitToKillAppTimeout" "3000" String
+            Write-Host "  Takes effect at next sign-in." -ForegroundColor Yellow
+        }
+        59 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAnimations" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\DWM" "EnableAeroPeek" 0
+        }
+        60 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\GameBar" "AutoGameModeEnabled" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\GameBar" "AllowAutoGameMode" 0
+        }
+        61 {
+            $ep = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
+            Set-Reg $ep "BackgroundModeEnabled" 0
+            Set-Reg $ep "HubsSidebarEnabled" 0
+            Set-Reg $ep "EdgeShoppingAssistantEnabled" 0
+        }
+        62 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "ShowRecent" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "ShowFrequent" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "ShowCloudFilesInQuickAccess" 0
+        }
+        63 { foreach ($t in $TelemetryTasks) { Set-TaskState $t[0] $t[1] $true } }
+        64 {
+            Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" "Disabled" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" "Disabled" 1
+            Set-SvcState 'WerSvc' $true
+        }
+        65 {
+            Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SettingSync" "DisableSettingSync" 2
+            Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SettingSync" "DisableSettingSyncUserOverride" 1
+        }
+        66 {
+            Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds" "EnableFeeds" 0
+            Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Feeds" "ShellFeedsTaskbarViewMode" 2
+        }
+        67 {
+            $adv = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            Set-Reg $adv "ShowTaskViewButton" 0
+            Set-Reg $adv "ShowCortanaButton" 0
+            Set-Reg "$adv\People" "PeopleBand" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" "HideSCAMeetNow" 1
+        }
+        68 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\WindowsInkWorkspace" "AllowWindowsInkWorkspace" 0 }
+        69 {
+            Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0
+        }
+        70 {
+            Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat" "ChatIcon" 3
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 0
+        }
+        71 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 0
+        }
+        72 {
+            New-Item -Path $CtxMenuKey -Force | Out-Null
+            New-ItemProperty -Path $CtxMenuKey -Name "(default)" -Value "" -PropertyType String -Force | Out-Null
+            Write-Host "  Takes effect after Explorer restarts (sign out and back in)." -ForegroundColor Yellow
+        }
+        73 {
+            $adv = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            Set-Reg $adv "Start_IrisRecommendations" 0
+            Set-Reg $adv "Start_TrackDocs" 0
+            Set-Reg $adv "Start_AccountNotifications" 0
+        }
+        74 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1 }
     }
 }
 
@@ -917,7 +1176,18 @@ function Disable-Tweak($Id) {
             Write-Host "  Global timer resolution override removed - back to Windows 10/11 default per-process behavior." -ForegroundColor Green
         }
         43 { Set-TaskState "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" $false }
-        44 { Write-Host "  OneDrive removal cannot be auto-reversed - reinstall from https://www.microsoft.com/microsoft-365/onedrive/download if needed." -ForegroundColor Yellow }
+        44 {
+            Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC"
+            # Windows keeps its own copy of the OneDrive installer, so this can be reversed
+            $stub = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+            if (-not (Test-Path $stub)) { $stub = "$env:SystemRoot\System32\OneDriveSetup.exe" }
+            if (Test-Path $stub) {
+                Start-Process $stub -ErrorAction SilentlyContinue
+                Write-Host "  OneDrive reinstall started from the copy built into Windows - it finishes in the background." -ForegroundColor Green
+            } else {
+                Write-Host "  OneDrive installer not found - download it from https://www.microsoft.com/microsoft-365/onedrive/download" -ForegroundColor Yellow
+            }
+        }
         45 {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsMSACloudSearchEnabled" 1
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SearchSettings" "IsAADCloudSearchEnabled" 1
@@ -933,6 +1203,7 @@ function Disable-Tweak($Id) {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 1
             Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 1
             Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\GameBar" "UseNexusForGameBarEnabled" 1
         }
         51 { Write-Host "  Copilot removal cannot be auto-reversed - reinstall from Microsoft Store if needed." -ForegroundColor Yellow }
         52 { Write-Host "  Shortcut cleanup cannot be auto-reversed - this is cosmetic only, no functionality is lost either way." -ForegroundColor Yellow }
@@ -953,6 +1224,80 @@ function Disable-Tweak($Id) {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapAssist" 1
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "SnapFill" 1
         }
+        57 {
+            foreach ($n in $CdmValues) { Set-Reg $CdmPath $n 1 }
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 1
+            Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures"
+        }
+        58 {
+            Set-Reg "HKCU:\Control Panel\Desktop" "MenuShowDelay" "400" String
+            Set-Reg "HKCU:\Control Panel\Desktop" "WaitToKillAppTimeout" "5000" String
+        }
+        59 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarAnimations" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\DWM" "EnableAeroPeek" 1
+        }
+        60 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\GameBar" "AutoGameModeEnabled" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\GameBar" "AllowAutoGameMode" 1
+        }
+        61 {
+            $ep = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
+            Remove-Reg $ep "BackgroundModeEnabled"
+            Remove-Reg $ep "HubsSidebarEnabled"
+            Remove-Reg $ep "EdgeShoppingAssistantEnabled"
+        }
+        62 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 2
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "ShowRecent" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "ShowFrequent" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "ShowCloudFilesInQuickAccess" 1
+        }
+        63 { foreach ($t in $TelemetryTasks) { Set-TaskState $t[0] $t[1] $false } }
+        64 {
+            Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" "Disabled" 0
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" "Disabled" 0
+            Set-SvcState 'WerSvc' $false
+        }
+        65 {
+            Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SettingSync" "DisableSettingSync"
+            Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SettingSync" "DisableSettingSyncUserOverride"
+        }
+        66 {
+            Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Feeds" "EnableFeeds"
+            Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Feeds" "ShellFeedsTaskbarViewMode" 0
+        }
+        67 {
+            $adv = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            Set-Reg $adv "ShowTaskViewButton" 1
+            Set-Reg $adv "ShowCortanaButton" 1
+            Set-Reg "$adv\People" "PeopleBand" 1
+            Remove-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" "HideSCAMeetNow"
+        }
+        68 { Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\WindowsInkWorkspace" "AllowWindowsInkWorkspace" }
+        69 {
+            Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests"
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 1
+        }
+        70 {
+            Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat" "ChatIcon"
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 1
+        }
+        71 {
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 1
+            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 1
+        }
+        72 {
+            Remove-Item -LiteralPath $CtxMenuRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  Takes effect after Explorer restarts (sign out and back in)." -ForegroundColor Yellow
+        }
+        73 {
+            $adv = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            Set-Reg $adv "Start_IrisRecommendations" 1
+            Set-Reg $adv "Start_TrackDocs" 1
+            Set-Reg $adv "Start_AccountNotifications" 1
+        }
+        74 { Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" }
     }
 }
 
@@ -1069,6 +1414,7 @@ function Show-Banner {
         Write-Host "  System Info" -ForegroundColor White
         Write-Host "  -----------" -ForegroundColor White
         Write-Host ("    OS           : {0}" -f $Global:SysInfo.OS)
+        Write-Host ("    Tweak profile: {0} (build {1})" -f $Global:OSLabel, $Global:WinBuild)
         Write-Host ("    Processor    : {0}" -f $Global:SysInfo.CPU)
         Write-Host ("    Cores        : {0}" -f $Global:SysInfo.Cores)
         Write-Host ("    RAM          : {0}" -f $Global:SysInfo.RAM)

@@ -11,7 +11,7 @@ $Author   = "shivansh"
 # set this to that exact raw URL. It's needed because a script run through
 # "irm | iex" has no file on disk, so self-elevation can't just relaunch a
 # file path - it needs to re-download and re-run itself in the new window.
-$ScriptUrl = "PUT_YOUR_RAW_SCRIPT_URL_HERE"
+$ScriptUrl = "https://raw.githubusercontent.com/GTE2232/lab-tool/refs/heads/main/lab.ps1"
 
 
 # ---- Self-elevate if not running as Administrator ----

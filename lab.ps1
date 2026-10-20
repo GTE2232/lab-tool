@@ -11,8 +11,7 @@ $Author   = "shivansh"
 # set this to that exact raw URL. It's needed because a script run through
 # "irm | iex" has no file on disk, so self-elevation can't just relaunch a
 # file path - it needs to re-download and re-run itself in the new window.
-$ScriptUrl = "https://raw.githubusercontent.com/GTE2232/lab-tool/refs/heads/main/lab.ps1"
-
+$ScriptUrl = "PUT_YOUR_RAW_SCRIPT_URL_HERE"
 
 # ---- Self-elevate if not running as Administrator ----
 # (Right-click "Run with PowerShell" does NOT run elevated, and closes the
@@ -227,11 +226,10 @@ while ($true) { Start-Sleep -Seconds 3600 }
     Set-Content -Path $TimerResScript -Value $body -Encoding UTF8
 
     # Stop any previous instance tracked by the PID file before starting fresh
-    if (Test-Path $TimerResPidFile) {
-        $oldPid = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue
-        if ($oldPid) { Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue }
-        Remove-Item $TimerResPidFile -Force -ErrorAction SilentlyContinue
-    }
+    # Only stop a process positively identified as our own enforcer
+    $old = Get-TimerEnforcerProcess
+    if ($old) { Stop-Process -Id $old.Id -Force -ErrorAction SilentlyContinue }
+    Remove-Item $TimerResPidFile -Force -ErrorAction SilentlyContinue
 
     # Genuinely hidden launch (not "-WindowStyle Hidden", which is unreliable
     # under Windows Terminal) - the script writes its own PID to the pid file
@@ -263,21 +261,15 @@ while ($true) { Start-Sleep -Seconds 3600 }
 }
 
 function Remove-TimerResolutionEnforcer {
-    if (Test-Path $TimerResPidFile) {
-        $oldPid = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue
-        if ($oldPid) { Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue }
-        Remove-Item $TimerResPidFile -Force -ErrorAction SilentlyContinue
-    }
+    # Only stop a process positively identified as our own enforcer
+    $old = Get-TimerEnforcerProcess
+    if ($old) { Stop-Process -Id $old.Id -Force -ErrorAction SilentlyContinue }
+    Remove-Item $TimerResPidFile -Force -ErrorAction SilentlyContinue
     try { Unregister-ScheduledTask -TaskName $TimerResTask -Confirm:$false -ErrorAction SilentlyContinue } catch {}
 }
 
 function Test-TimerResolutionEnforcerRunning {
-    if (-not (Test-Path $TimerResPidFile)) { return $false }
-    $storedPid = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue
-    if (-not $storedPid) { return $false }
-    $proc = Get-Process -Id $storedPid -ErrorAction SilentlyContinue
-    # Guard against a recycled PID: it must still be a PowerShell process
-    return [bool]($proc -and ($proc.ProcessName -like 'powershell*'))
+    return [bool](Get-TimerEnforcerProcess)
 }
 
 # P/Invoke for individual visual-effect toggles (SystemParametersInfo)
@@ -566,7 +558,7 @@ function Test-TweakApplied($Id) {
         24 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency") -eq 0 }
         25 { return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "IconsOnly") -eq 1 }
         26 { return (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\Power" "HibernateEnabled") -eq 0 }
-        27 { $present = $false; foreach ($a in $BundledApps) { if (Get-AppxPackage -Name $a -ErrorAction SilentlyContinue) { $present = $true } }; return (-not $present) }
+        27 { $set = Get-InstalledAppSet; $present = $false; foreach ($a in $BundledApps) { if ($set.ContainsKey($a)) { $present = $true } }; return (-not $present) }
         28 { return Get-SvcDisabled 'PcaSvc' }
         29 { return (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control" "SvcHostSplitThresholdInKB") -eq 0x0F000000 }
         30 { $cs = Get-CimInstance Win32_ComputerSystem; return (-not $cs.AutomaticManagedPagefile) }
@@ -619,7 +611,7 @@ function Test-TweakApplied($Id) {
         51 {
             $names = @("Microsoft.Copilot", "Microsoft.Windows.Copilot", "MicrosoftWindows.Client.CoPilot")
             $present = $false
-            foreach ($n in $names) { if (Get-AppxPackage -Name $n -ErrorAction SilentlyContinue) { $present = $true } }
+            $set = Get-InstalledAppSet; foreach ($n in $names) { if ($set.ContainsKey($n)) { $present = $true } }
             return (-not $present)
         }
         52 { return -not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Cortana.lnk") -and -not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Cortana.lnk") }
@@ -714,6 +706,7 @@ function Test-TweakApplied($Id) {
 # APPLY
 # ===========================================================
 function Enable-Tweak($Id) {
+    $Global:AppxCache = $null
     switch ($Id) {
         1  { Set-SvcState 'SysMain' $true }
         2  { Set-SvcState 'DiagTrack' $true }
@@ -1075,6 +1068,7 @@ function Enable-Tweak($Id) {
 # DISABLE / REVERT
 # ===========================================================
 function Disable-Tweak($Id) {
+    $Global:AppxCache = $null
     switch ($Id) {
         1  { Set-SvcState 'SysMain' $false }
         2  { Set-SvcState 'DiagTrack' $false }
@@ -1305,6 +1299,79 @@ function Disable-Tweak($Id) {
 # UI
 # ===========================================================
 # ---- Make the console bigger and easier to read ----
+# ---- Input handling ----
+# Anything typed while a slow screen is still redrawing sits in the console's
+# input buffer and then answers whatever prompt appears next (a stray Enter
+# dismisses a "Press Enter" pause; a stray 0 backs out of a menu). Draining the
+# buffer right before each prompt means a prompt only ever sees what was typed
+# in response to it.
+function Clear-PendingInput {
+    try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
+}
+
+function Read-MenuChoice($Prompt) {
+    Clear-PendingInput
+    return ("$(Read-Host $Prompt)").Trim()
+}
+
+# Returns $true when the user typed 0 - so "0" at a pause means "go back", the
+# same as everywhere else, instead of being swallowed as a plain Enter.
+function Wait-Continue($Prompt = "`nPress Enter to continue (0 = back)") {
+    return ((Read-MenuChoice $Prompt) -eq '0')
+}
+
+function Disable-ConsoleQuickEdit {
+    # Classic console windows start "selecting text" the moment you click in
+    # them. While that is active the first key you press (Enter) only cancels
+    # the selection and is never delivered to the script, and output is paused -
+    # which looks exactly like a menu that needs "0" typed twice.
+    try {
+        Add-Type -Namespace UIT63 -Name ConMode -MemberDefinition @"
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+"@ -ErrorAction Stop
+        $h = [UIT63.ConMode]::GetStdHandle(-10)
+        [uint32]$mode = 0
+        if ([UIT63.ConMode]::GetConsoleMode($h, [ref]$mode)) {
+            $m = [int64]$mode
+            if (($m -band 0x40) -ne 0) { $m = $m - 0x40 }
+            $m = $m -bor 0x80
+            [UIT63.ConMode]::SetConsoleMode($h, [uint32]$m) | Out-Null
+        }
+    } catch {}
+}
+
+# ---- Installed-app lookup, done once instead of once per app ----
+# Get-AppxPackage is slow (especially on an HDD). The status screens used to
+# call it ~50 times per redraw; this reads the full list once and reuses it.
+function Get-InstalledAppSet {
+    if ($Global:AppxCache -and $Global:AppxCacheTime -and (((Get-Date) - $Global:AppxCacheTime).TotalSeconds -lt 30)) {
+        return $Global:AppxCache
+    }
+    $set = @{}
+    try { Get-AppxPackage -ErrorAction SilentlyContinue | ForEach-Object { $set[$_.Name] = $true } } catch {}
+    $Global:AppxCache = $set
+    $Global:AppxCacheTime = Get-Date
+    return $set
+}
+
+# ---- Positively identify the timer-resolution enforcer process ----
+# The PID file survives reboots, so its number can later belong to an unrelated
+# process. Never act on the PID alone: it must be a PowerShell process, and
+# where the command line is readable it must be our enforcer script.
+function Get-TimerEnforcerProcess {
+    if (-not (Test-Path $TimerResPidFile)) { return $null }
+    $raw = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
+    $n = 0
+    if (-not [int]::TryParse("$raw".Trim(), [ref]$n) -or $n -le 0) { return $null }
+    $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $n" -ErrorAction SilentlyContinue
+    if (-not $cim) { return $null }
+    if ($cim.Name -notlike 'powershell*') { return $null }
+    if ($cim.CommandLine -and ($cim.CommandLine -notmatch 'TimerResEnforcer')) { return $null }
+    return (Get-Process -Id $n -ErrorAction SilentlyContinue)
+}
+
 function Set-ConsoleReadability {
     try {
         $Host.UI.RawUI.WindowTitle = "UIT-63 FDIV Console"
@@ -1313,7 +1380,7 @@ function Set-ConsoleReadability {
         # Only widen the buffer for long lines - window size/position is left
         # as whatever the host opened with.
         $ui = $Host.UI.RawUI
-        $ui.BufferSize = New-Object System.Management.Automation.Host.Size(130, 3000)
+        $ui.BufferSize = New-Object System.Management.Automation.Host.Size($ui.BufferSize.Width, 3000)
     } catch {}
 
     # Bump the font size up by exactly 1 from whatever it currently is,
@@ -1436,6 +1503,7 @@ function Show-Banner {
 function Show-TweakList {
     param([switch]$Numbered)
     $ids = $TweakInfo.Keys | Sort-Object
+    Write-Host "  Reading the current status of each tweak - this can take a few seconds on older PCs..." -ForegroundColor DarkGray
     $currentTier = ""
     foreach ($id in $ids) {
         $info = $TweakInfo[$id]
@@ -1671,6 +1739,7 @@ function Set-MacRandomization([bool]$Enable) {
 }
 
 function Install-SingleApp($app) {
+    $Global:AppxCache = $null
     if (Get-AppxPackage -Name $app -ErrorAction SilentlyContinue) {
         Write-Host "  $app is already installed." -ForegroundColor Yellow
         return
@@ -1698,11 +1767,12 @@ function Menu-InstallApps {
         Write-Host "  Install Windows Apps (apps this tool can remove)" -ForegroundColor White
         Write-Host "  ----------------------------------------------------" -ForegroundColor White
         Write-Host ""
+        $appSet = Get-InstalledAppSet
         $sorted = $BundledApps | Sort-Object
         $num = 1
         $lookup = @{}
         foreach ($app in $sorted) {
-            $installed = [bool](Get-AppxPackage -Name $app -ErrorAction SilentlyContinue)
+            $installed = $appSet.ContainsKey($app)
             $tag = if ($installed) { "[INSTALLED]" } else { "[NOT INSTALLED]" }
             $color = if ($installed) { "Green" } else { "DarkGray" }
             Write-Host ("  {0,3}. {1,-40} {2}" -f $num, $app, $tag) -ForegroundColor $color
@@ -1717,11 +1787,11 @@ function Menu-InstallApps {
         Write-Host "  whether that app is still listed there. If it fails, search the Store" -ForegroundColor DarkGray
         Write-Host "  app manually for the app name as a fallback." -ForegroundColor DarkGray
         Write-Host ""
-        $choice = Read-Host "Enter a number, A for all, or 0 to go back"
+        $choice = Read-MenuChoice "Enter a number, A for all, or 0 to go back"
         if ($choice -eq '0') { return }
 
         if ($choice -match '^[Aa]$') {
-            $toInstall = $sorted | Where-Object { -not (Get-AppxPackage -Name $_ -ErrorAction SilentlyContinue) }
+            $toInstall = @($sorted | Where-Object { -not $appSet.ContainsKey($_) })
             if ($toInstall.Count -eq 0) {
                 Write-Host "`nEverything in this list is already installed." -ForegroundColor Yellow
             } else {
@@ -1729,7 +1799,7 @@ function Menu-InstallApps {
                 foreach ($app in $toInstall) { Install-SingleApp $app }
                 Write-Host "`nDone." -ForegroundColor Green
             }
-            Read-Host "`nPress Enter to continue"
+            if (Wait-Continue) { return }
             continue
         }
 
@@ -1741,7 +1811,7 @@ function Menu-InstallApps {
         }
         Write-Host ""
         Install-SingleApp $lookup[$idNum]
-        Read-Host "`nPress Enter to continue"
+        if (Wait-Continue) { return }
     }
 }
 
@@ -1762,8 +1832,9 @@ function Menu-Diagnostics {
         Write-Host "  These are standard, built-in Windows diagnostic tools - this menu just" -ForegroundColor DarkGray
         Write-Host "  launches them for you rather than doing anything unusual under the hood." -ForegroundColor DarkGray
         Write-Host ""
-        $sel = Read-Host "Select an option"
+        $sel = Read-MenuChoice "Select an option"
         Write-Host ""
+        $invalid = $false
         switch ($sel) {
             '1' {
                 Write-Host "Opening Windows Memory Diagnostic. This requires a restart to actually" -ForegroundColor Cyan
@@ -1783,7 +1854,7 @@ function Menu-Diagnostics {
             '3' {
                 Write-Host "This will scan and fix errors, and requires a restart to run (the drive" -ForegroundColor Yellow
                 Write-Host "can't be locked while Windows is using it)." -ForegroundColor Yellow
-                $confirm = Read-Host "Schedule this for next restart? (Y/N)"
+                $confirm = Read-MenuChoice "Schedule this for next restart? (Y/N)"
                 if ($confirm -match '^[Yy]') {
                     try {
                         Repair-Volume -DriveLetter ($env:SystemDrive.TrimEnd(':')) -OfflineScanAndFix -ErrorAction Stop
@@ -1811,16 +1882,16 @@ function Menu-Diagnostics {
                 Write-Host "a visible PowerShell window at every boot. Tweaks that depend on these" -ForegroundColor Yellow
                 Write-Host "(Global Timer Resolution, font smoothing enforcement, DNS enforcement)" -ForegroundColor Yellow
                 Write-Host "will stop self-healing until you re-toggle them from the main menu." -ForegroundColor Yellow
-                $confirm = Read-Host "Continue? (Y/N)"
+                $confirm = Read-MenuChoice "Continue? (Y/N)"
                 if ($confirm -match '^[Yy]') {
                     Remove-AllUit63Tasks
                     Write-Host "Done. Old scheduled tasks and their background processes have been removed." -ForegroundColor Green
                 }
             }
             '0' { return }
-            default { }
+            default { $invalid = $true }
         }
-        if ($sel -ne '0') { Read-Host "`nPress Enter to continue" }
+        if (($sel -ne '0') -and (-not $invalid)) { if (Wait-Continue) { return } }
     }
 }
 
@@ -1838,8 +1909,9 @@ function Menu-AdditionalTweaks {
         Write-Host "  7. Disable MAC address randomization (Wi-Fi)"
         Write-Host "  0. Back to main menu"
         Write-Host ""
-        $sel = Read-Host "Select an option"
+        $sel = Read-MenuChoice "Select an option"
         Write-Host ""
+        $invalid = $false
         switch ($sel) {
             '1' {
                 Set-PhotoViewerDefault
@@ -1850,7 +1922,7 @@ function Menu-AdditionalTweaks {
                 Write-Host "  - that protection is intentional. Photo Viewer is now registered and" -ForegroundColor Yellow
                 Write-Host "  available to pick, but the final selection needs one manual step." -ForegroundColor Yellow
                 Write-Host ""
-                $open = Read-Host "Open Settings > Default Apps now to pick it? (Y/N)"
+                $open = Read-MenuChoice "Open Settings > Default Apps now to pick it? (Y/N)"
                 if ($open -match '^[Yy]') {
                     Start-Process "ms-settings:defaultapps"
                     Write-Host "  In Settings, search 'Windows Photo Viewer' or set it per image type (.jpg, .png, etc)." -ForegroundColor Cyan
@@ -1860,7 +1932,7 @@ function Menu-AdditionalTweaks {
                 Restore-PhotosAppDefault
                 Write-PrevLog "Additional: Photos app default restored"
                 Write-Host ""
-                $open = Read-Host "Open Settings > Default Apps now to pick Photos? (Y/N)"
+                $open = Read-MenuChoice "Open Settings > Default Apps now to pick Photos? (Y/N)"
                 if ($open -match '^[Yy]') {
                     Start-Process "ms-settings:defaultapps"
                 }
@@ -1871,9 +1943,14 @@ function Menu-AdditionalTweaks {
             '6' { Set-MacRandomization $true; Write-PrevLog "Additional: MAC randomization enabled" }
             '7' { Set-MacRandomization $false; Write-PrevLog "Additional: MAC randomization disabled" }
             '0' { return }
-            default { continue }
+            default { $invalid = $true }
         }
-        Read-Host "`nPress Enter to continue"
+        if ($invalid) {
+            Write-Host "Invalid choice." -ForegroundColor Red
+            Start-Sleep -Seconds 1
+            continue
+        }
+        if (Wait-Continue) { return }
     }
 }
 
@@ -1882,12 +1959,12 @@ function Menu-Restore {
         Show-Banner
         Write-Host "  Restore to a Save Point" -ForegroundColor White
         Write-Host "  ------------------------" -ForegroundColor White
-        $snapshots = Get-Snapshots
+        $snapshots = @(Get-Snapshots)
         if ($snapshots.Count -eq 0) {
             Write-Host "`n  No save points yet. Run Apply All, Apply 4GB, or Disable All" -ForegroundColor DarkGray
             Write-Host "  at least once - a save point is created automatically each time." -ForegroundColor DarkGray
             Write-Host ""
-            Read-Host "Press Enter to go back"
+            Read-MenuChoice "Press Enter to go back" | Out-Null
             return
         }
 
@@ -1907,7 +1984,7 @@ function Menu-Restore {
             $displayNum++
         }
         Write-Host ""
-        $choice = Read-Host "Enter a save point number to restore to (0 = back to main menu)"
+        $choice = Read-MenuChoice "Enter a save point number to restore to (0 = back to main menu)"
         if ($choice -eq '0') { return }
 
         $idNum = 0
@@ -1940,7 +2017,7 @@ function Menu-Restore {
         Save-Snapshot "Restored to save point"
         Assert-FontSmoothingOn
         Write-Host "Restore complete." -ForegroundColor Green
-        Read-Host "Press Enter to continue"
+        Wait-Continue "Press Enter to continue" | Out-Null
         return
     }
 }
@@ -2020,7 +2097,7 @@ function Menu-Individual {
         Show-Banner
         Write-Host "  Apply/Disable individually - enter a number to toggle, 0 to go back`n" -ForegroundColor White
         Show-TweakList -Numbered
-        $choice = Read-Host "Enter tweak number (0 = back to main menu)"
+        $choice = Read-MenuChoice "Enter tweak number (0 = back to main menu)"
         if ($choice -eq '0') { return }
         $idCandidate = 0
         if ([int]::TryParse($choice, [ref]$idCandidate) -and $TweakInfo.ContainsKey($idCandidate)) {
@@ -2036,7 +2113,7 @@ function Menu-Individual {
                 Write-Host "`nApplied: $($TweakInfo[$id].Name)" -ForegroundColor Green
             }
             Assert-FontSmoothingOn
-            Start-Sleep -Seconds 1
+            if (Wait-Continue) { return }
         } else {
             Write-Host "`nInvalid choice." -ForegroundColor Red
             Start-Sleep -Seconds 1
@@ -2083,13 +2160,14 @@ function Show-ManagedDiagnostics {
     Write-Host "  where, run this in an elevated PowerShell window and open the report:" -ForegroundColor White
     Write-Host "    gpresult /h `"$env:USERPROFILE\Desktop\GPReport.html`"" -ForegroundColor Cyan
     Write-Host ""
-    Read-Host "Press Enter to continue"
+    Wait-Continue "Press Enter to continue" | Out-Null
 }
 
 # ===========================================================
 # MAIN MENU
 # ===========================================================
 Set-ConsoleReadability
+Disable-ConsoleQuickEdit
 $Global:SysInfo = Get-SystemInfoOnce
 Assert-FontSmoothingOn
 Register-FontSmoothingEnforcer
@@ -2111,13 +2189,13 @@ try {
         Write-Host "  D. Diagnostics and Repair (Memory, Disk, SFC, DISM)"
         Write-Host "  0. Exit"
         Write-Host ""
-        $sel = Read-Host "Select an option"
+        $sel = Read-MenuChoice "Select an option"
 
         switch ($sel) {
-            '1' { Apply-AllBase; Read-Host "`nPress Enter to continue" | Out-Null }
-            '2' { Apply-All4GB;  Read-Host "`nPress Enter to continue" | Out-Null }
-            '3' { Disable-AllApplied; Read-Host "`nPress Enter to continue" | Out-Null }
-            '4' { Show-Banner; Show-TweakList; Read-Host "Press Enter to continue" | Out-Null }
+            '1' { Apply-AllBase; Wait-Continue "`nPress Enter to continue" | Out-Null }
+            '2' { Apply-All4GB;  Wait-Continue "`nPress Enter to continue" | Out-Null }
+            '3' { Disable-AllApplied; Wait-Continue "`nPress Enter to continue" | Out-Null }
+            '4' { Show-Banner; Show-TweakList; Wait-Continue "Press Enter to continue" | Out-Null }
             '5' { Menu-Individual }
             '6' { Show-ManagedDiagnostics }
             '7' { Menu-Restore }

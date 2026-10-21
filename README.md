@@ -13,7 +13,7 @@ irm https://raw.githubusercontent.com/GTE2232/lab-tool/refs/heads/main/lab.ps1 |
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?style=flat-square&logo=windows)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE?style=flat-square&logo=powershell&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/version-1.1.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.2.0-blue?style=flat-square)
 ![Reversible](https://img.shields.io/badge/every%20tweak-reversible-blueviolet?style=flat-square)
 
 </div>
@@ -25,6 +25,7 @@ irm https://raw.githubusercontent.com/GTE2232/lab-tool/refs/heads/main/lab.ps1 |
 - [What Is This](#what-is-this)
 - [Why It Exists](#why-it-exists)
 - [How It Works](#how-it-works)
+- [Windows 10 vs Windows 11](#windows-10-vs-windows-11)
 - [The Operating-System Problem, Explained](#the-operating-system-problem-explained)
 - [Quick Start](#quick-start)
 - [Manual — Menu Options 1 Through 0](#manual--menu-options-1-through-0)
@@ -35,6 +36,7 @@ irm https://raw.githubusercontent.com/GTE2232/lab-tool/refs/heads/main/lab.ps1 |
 - [Known Limitations & FAQ](#known-limitations--faq)
 - [Benefits](#benefits)
 - [Roadmap](#roadmap)
+- [Changelog](#changelog)
 - [License](#license)
 
 ---
@@ -44,6 +46,8 @@ irm https://raw.githubusercontent.com/GTE2232/lab-tool/refs/heads/main/lab.ps1 |
 UIT-63 (FDIV Edition) is a single-file, self-elevating PowerShell tool that debloats and optimizes ageing Windows 10/11 machines. It was built for the hardware still common in institute computer labs — older Intel Core processors, 4GB RAM, and mechanical hard disk drives — but applies cleanly to any Windows 10/11 install that's slower than it should be.
 
 It applies a curated set of **reversible, operating-system-level changes** through a simple numbered menu: disabling unnecessary background services, trimming telemetry, tuning storage and memory behaviour, restoring Windows 7-era timing behaviour, and removing bundled apps that serve no purpose on a coursework machine — plus a built-in diagnostics menu for memory, disk, and system-file repair. Every change is logged and individually undoable.
+
+It detects on its own whether it is running on **Windows 10 or Windows 11** and applies the matching tweak set — no prompt, no switch to flip.
 
 Rather than a one-shot script, it behaves like a small management console:
 
@@ -56,6 +60,7 @@ Rather than a one-shot script, it behaves like a small management console:
   System Info
   -----------
     OS           : Windows 10 Pro (Build 19045, 64-bit)
+    Tweak profile: Windows 10 (build 19045)
     Processor    : Intel(R) Core(TM) i5-2400 @ 3.10GHz
     Cores        : 4C / 4T
     RAM          : 4 GB
@@ -94,13 +99,33 @@ Every tweak is implemented as three linked actions:
 
 | Action | What it does |
 |---|---|
-| **Check** | Reads the actual current registry/service/filesystem state to report whether the tweak is applied — never assumed, never cached |
+| **Check** | Reads the actual current registry/service/filesystem state to report whether the tweak is applied — never assumed (the installed-apps list is read once per screen instead of once per app, purely for speed) |
 | **Apply** | Makes the change (disabling a service, setting a registry value, running a supported system command) |
 | **Revert** | Undoes exactly that change, restoring prior behaviour |
 
 Bulk actions (*Apply All*, *Apply 4GB tier*, *Disable All*) run this Check → Apply/Revert logic across every tweak in the group, **skipping anything already in the desired state**. A Windows System Restore point is created automatically before any bulk action, and a save-point system records the full status of every tweak after each run — so the machine's entire configuration can be rolled back to any earlier snapshot, not just factory defaults.
 
-Two settings (font smoothing and DNS) are additionally enforced via **scheduled tasks that reapply at every logon/boot**, since both were observed reverting on some hardware between sessions through mechanisms outside the tool's own runtime — rather than a one-time fix that silently stops working, they self-heal independently of whether the tool is ever opened again.
+Three settings (font smoothing, DNS, and the timer-resolution holder) are additionally enforced via **scheduled tasks that reapply at every logon/boot**, since they were observed reverting — or, for the timer, cannot exist without a running process — outside the tool's own runtime. Rather than a one-time fix that silently stops working, they self-heal independently of whether the tool is ever opened again, and every background launch is genuinely hidden (no window flash at startup).
+
+---
+
+## Windows 10 vs Windows 11
+
+The script decides which Windows generation it is on **silently, at startup**: Windows 11 still reports version 10.0, so it reads the build number — **22000 and above is Windows 11**. The result is shown on the main menu as `Tweak profile`.
+
+Each tweak is tagged *common*, *Windows 10 only*, or *Windows 11 only*, and tweaks that don't apply to the running OS are simply **not shown** — in the status list, individual toggle, bulk actions, and save points alike. Tweak numbers are identical on both systems, so logs and save points stay comparable.
+
+| Area | Windows 10 | Windows 11 |
+|---|---|---|
+| Taskbar clutter | News and Interests feed; Cortana, People, Meet Now and Task View buttons | Widgets; Chat icon; Task View button and Search box |
+| Shell behaviour | — | Classic right-click menu restored; Start menu recommendations and tracking off |
+| Assistants / AI | Cortana off + leftover cleanup; Ink Workspace off | Recall policy off (Copilot is handled on both) |
+| App removal list | Common list + Paint 3D | Common list + Widgets host, Dev Home, Power Automate, BingSearch |
+| Diagnostic data level | Labelled "Basic" | Labelled "Required (minimum)" — same setting, Windows 11's name for it |
+| Power plan | High Performance | High Performance — recreated under its standard GUID if Windows 11 hides it |
+| Timer resolution | Global behaviour restored; builds before 2004 already behave this way, and the tool says so | Same, plus the hidden holder process opts out of Windows 11's rule that drops high-resolution requests from hidden/occluded windows |
+
+> Windows 11 support is new in v1.2.0 and has had less real-world testing than Windows 10 — try it on one machine first.
 
 ---
 
@@ -166,8 +191,10 @@ Right-click the script and choose *Run with PowerShell* — it handles its own U
 | **7** | Restore to a Save Point | Roll the entire tweak configuration back to any previous automatic snapshot. |
 | **8** | Additional Tweaks | Photo Viewer restoration, DNS provider (Google/Cloudflare), Wi-Fi MAC randomization — applied individually, not in bulk. |
 | **9** | Install Windows Apps | Reinstall anything the tool removed, individually or all at once, via winget/Microsoft Store. |
-| **D** | Diagnostics and Repair | Launches Windows' own built-in tools: Memory Diagnostic, quick or full Disk Check, System File Checker, and DISM component-store repair. |
+| **D** | Diagnostics and Repair | Launches Windows' own built-in tools: Memory Diagnostic, quick or full Disk Check, System File Checker, and DISM component-store repair — plus a one-click cleanup of leftover UIT-63 scheduled tasks from older versions. |
 | **0** | Exit | Closes the tool. |
+
+**Navigation:** `0` always means *back*. At any "Press Enter to continue" pause inside a sub-menu, `0` goes back too, instead of being swallowed as a plain Enter. Keystrokes typed while a slow screen is still redrawing are discarded before each prompt, so a prompt only ever sees what you typed in response to it.
 
 ---
 
@@ -198,11 +225,11 @@ Right-click the script and choose *Run with PowerShell* — it handles its own U
 | Bing in search off | Keeps Start/Explorer search local instead of a network round-trip. |
 | Feedback frequency: Never | Stops periodic feedback-request interruptions. |
 | Activity History off | Stops recording and uploading cross-device usage history. |
-| Diagnostic data: Basic | Reduces telemetry volume collected and transmitted. |
+| Diagnostic data: Basic | Reduces telemetry volume collected and transmitted (labelled "Required" on Windows 11). |
 | Advertising ID off | Disables cross-app ad-personalization tracking. |
 | Tailored Experiences off | Stops diagnostic-data-driven suggestion generation. |
 | Windows Copilot off | Removes the AI assistant's background footprint. |
-| Cortana off | Removes the legacy voice-assistant subsystem. |
+| Cortana off *(Windows 10 only)* | Removes the legacy voice-assistant subsystem. |
 | Storage Sense off | Stops automatic background disk scans (documented trade-off on HDDs — see FAQ). |
 
 </details>
@@ -214,7 +241,7 @@ Right-click the script and choose *Run with PowerShell* — it handles its own U
 |---|---|
 | Memory Integrity (Core Isolation) off | Removes hypervisor-based memory-protection overhead poorly suited to this CPU generation (documented security trade-off). |
 | Background apps off | Stops UWP apps running/updating while not in focus. |
-| Power plan: High Performance | Avoids CPU downclocking latency between bursts of activity. |
+| Power plan: High Performance | Avoids CPU downclocking latency between bursts of activity. Recreated under its standard GUID if Windows hides it (common on Windows 11). |
 | Custom visual effects | Trims compositing-heavy effects (menu fade, combo-box slide, cursor shadow) while explicitly keeping font smoothing, control animation, and window shadows on. |
 | Transparency off | Removes GPU/CPU-intensive blur compositing. |
 | Explorer thumbnails off | Shows generic icons instead of decoding file contents to populate a folder view. |
@@ -257,7 +284,7 @@ Right-click the script and choose *Run with PowerShell* — it handles its own U
 | Location tracking off | Disables system-wide location services. |
 | Mobile broadband metadata task off | Removes a background task irrelevant to non-cellular desktops. |
 | Speech model download task off | Stops background download of speech-recognition data. |
-| ~40 bundled apps removed | Xbox suite, Bing content apps, Skype, Wallet, Whiteboard, Maps, Zune Music/Video, Phone Link, Copilot, and more — reinstall any of them from Option 9. |
+| ~40 bundled apps removed | Xbox suite, Bing content apps, Skype, Wallet, Whiteboard, Maps, Zune Music/Video, Phone Link, Copilot, and more — reinstall any of them from Option 9. The list adapts to your Windows version (see [Windows 10 vs Windows 11](#windows-10-vs-windows-11)). |
 
 </details>
 
@@ -277,9 +304,9 @@ Right-click the script and choose *Run with PowerShell* — it handles its own U
 
 | Tweak | What it does and why |
 |---|---|
-| Global Timer Resolution (8ms, Windows 7-style) | Windows 10 changed the scheduler tick from a system-wide 1ms resolution (Windows 7's behaviour when any app requested it) to per-process only. This restores the global behaviour and holds it at 8ms via a small self-healing background process — see [Known Limitations](#known-limitations--faq) for how this is kept genuinely invisible. |
+| Global Timer Resolution (8ms, Windows 7-style) | Windows 10 changed the scheduler tick from a system-wide 1ms resolution (Windows 7's behaviour when any app requested it) to per-process only. This restores the global behaviour and holds it at 8ms via a small self-healing background process — see [Known Limitations](#known-limitations--faq) for how this is kept genuinely invisible. The helper is pre-built once into a small `.dll` so it starts quickly even on slow hardware, and on Windows 11 it opts out of the rule that drops timer requests from hidden windows. |
 | Compatibility Appraiser telemetry off | Disables `CompatTelRunner.exe`'s background app-inventory scans — a well-documented, frequent cause of unexplained CPU/disk spikes on older hardware that Windows 7 never had. |
-| OneDrive uninstalled | Removes OneDrive's constant background sync-checking, which Windows 7 never shipped with by default. |
+| OneDrive uninstalled | Removes OneDrive's constant background sync-checking, which Windows 7 never shipped with by default. Also blocks it for other and future profiles, and is reversible — turning it off reinstalls from the copy Windows keeps built in. |
 
 </details>
 
@@ -313,6 +340,49 @@ Not tweaks — these launch Windows' own built-in diagnostic tools directly, not
 | Disk Check — full scan and fix | Schedules an offline scan-and-fix for the next restart. |
 | System File Checker | Runs `sfc /scannow`. |
 | Component Store Repair | Runs `DISM /Online /Cleanup-Image /RestoreHealth` — pairs well with SFC if corruption is found that SFC alone can't fix. |
+| Remove leftover UIT-63 scheduled tasks | Clears every background task this tool has ever registered (font smoothing, timer resolution, DNS), including ones from older versions. Self-healing for those tweaks stops until you re-toggle them. |
+
+</details>
+
+<details>
+<summary><strong>4.11 — Shell, Explorer, Edge and Telemetry (Windows 10 and 11)</strong></summary>
+
+| Tweak | What it does and why |
+|---|---|
+| Sponsored suggestions, tips and silent app installs off | Stops Windows quietly re-installing promoted apps and showing tips/welcome screens. |
+| Snappier menus and faster app-close | Menus open at 100ms instead of 400ms; apps get 3 seconds (not 5) to close at shutdown. Deliberately does *not* auto-kill hung apps or shorten the hung-app timeout — on a slow disk that would hide real stalls and risk unsaved work. |
+| Taskbar animations and Aero Peek off | Removes two small compositing costs from the taskbar. |
+| Game Mode off | Stops a gaming-oriented scheduler hint with no use on a coursework machine. |
+| Edge background mode, sidebar, shopping off | Stops Edge staying resident in RAM after it's closed — a real saving at 4GB. |
+| Explorer opens to This PC; recent/frequent items off | Avoids enumerating recent, frequent and cloud items every time Explorer opens — slow on an HDD. |
+| CEIP, feedback and disk-diagnostic tasks off | Disables a set of telemetry scheduled tasks. |
+| Windows Error Reporting off | Stops crash-report collection (a diagnostics trade-off, noted in the tweak). |
+| Settings sync off | Stops background settings sync, irrelevant for local lab accounts. |
+
+</details>
+
+<details>
+<summary><strong>4.12 — Windows 10 Only</strong></summary>
+
+| Tweak | What it does and why |
+|---|---|
+| News and Interests feed off | Removes the taskbar feed, which runs a WebView in the background — noticeably heavy on weak hardware. |
+| Taskbar clutter off | Hides the Cortana, People, Meet Now and Task View buttons. |
+| Windows Ink Workspace off | Removes a pen-input feature desktops don't use. |
+
+</details>
+
+<details>
+<summary><strong>4.13 — Windows 11 Only</strong></summary>
+
+| Tweak | What it does and why |
+|---|---|
+| Widgets off | Disables the Widgets board and its taskbar button. |
+| Chat (Teams) icon off | Removes the consumer Chat taskbar icon. |
+| Task View button and Search box hidden | Trims the taskbar. |
+| Classic right-click menu restored | Skips the extra "Show more options" step and the heavier modern menu; takes effect after signing out and back in. |
+| Start menu recommendations and tracking off | Stops the Recommended section and recent-file tracking in Start. |
+| Recall / AI snapshot policy off | Blocks the snapshot feature policy-wide (only relevant on newer hardware). |
 
 </details>
 
@@ -328,14 +398,18 @@ Not tweaks — these launch Windows' own built-in diagnostic tools directly, not
 - To fully undo everything: **Option 3** (Disable All Applied), or **Option 7** to restore a save point from before any changes were made.
 - **No option disables Windows Defender, Windows Update, SmartScreen, or CPU security mitigations** — deliberate, so the tool stays safe on internet-connected, multi-user machines.
 
-**Compatibility note:** built and tested primarily on Windows 10. Most tweaks use mechanisms (registry policies, service configuration, NTFS/fsutil behaviour) unchanged on Windows 11, so it's expected to work there — but treat a Windows 11 machine as a first-time test case, not an assumed identical target.
+**Compatibility note:** Windows 10 is the most heavily tested target. The tool detects Windows 11 automatically and applies a Windows 11 profile, but that profile is newer — treat a Windows 11 machine as a first-time test case.
+
+**Upgrading from an older version:** run **Option D → 6** to clear any old background tasks, then re-apply Timer Resolution and OneDrive so they pick up the current fixes — a newer script file doesn't retroactively repair a task that's already registered.
 
 ---
 
 ## Safety Model
 
 - ✅ System Restore checkpoint before any bulk action
-- ✅ Live status checking — never a cached assumption
+- ✅ Live status checking — read from the real system state, never assumed
+- ✅ OS-aware: Windows 11 never receives Windows-10-only changes, and vice versa
+- ✅ Never stops a process it can't positively identify as its own (the timer helper is verified by name and command line, not just a saved PID)
 - ✅ Every tweak individually reversible, in addition to bulk apply/disable
 - ✅ Full timestamped audit log (`prev.txt` on the Desktop) for fleet-wide accountability
 - ✅ Save-point snapshots after every bulk action — roll back to *any* previous state, not just factory defaults
@@ -345,7 +419,7 @@ Not tweaks — these launch Windows' own built-in diagnostic tools directly, not
 
 ## Requirements
 
-- Windows 10 (primary target) or Windows 11 (expected to work, less extensively tested)
+- Windows 10 or Windows 11 — detected automatically (the Windows 11 profile is newer and less field-tested)
 - PowerShell 5.1 (ships with Windows 10/11 by default)
 - Administrator rights (the script handles elevation itself)
 
@@ -369,7 +443,19 @@ On some hardware, interface index renumbering (or a router/domain policy) can re
 It's a documented trade-off, not a strict win — disabling it removes a background disk-scanning source, but on an HDD genuinely short on space, Storage Sense's automatic cleanup can be more helpful than harmful. Judge by your actual disk headroom.
 
 **A PowerShell window pops up briefly every time the PC starts — is that expected?**
-No — that was a real bug in earlier versions. A few background self-healing tasks (font smoothing, timer resolution) launch at logon, and `-WindowStyle Hidden` on `powershell.exe` is unreliable specifically when Windows Terminal is set as the default terminal app — it can still flash a visible window. Fixed by routing these through a `WScript.Shell.Run` wrapper (window style `0`), which hides the window at the OS level regardless of terminal settings. If you installed a version before this fix, re-running the relevant tweak (Option 5, or re-applying via Option 1) replaces the old scheduled task with the corrected one.
+No — that was a real bug in earlier versions. A few background self-healing tasks (font smoothing, timer resolution) launch at logon, and `-WindowStyle Hidden` on `powershell.exe` is unreliable specifically when Windows Terminal is set as the default terminal app — it can still flash a visible window. Fixed by routing these through a `WScript.Shell.Run` wrapper (window style `0`), which hides the window at the OS level regardless of terminal settings. If you installed a version before this fix, run **Option D → 6** to remove the old tasks, then re-apply the tweaks.
+
+**How does it know whether I'm on Windows 10 or 11?**
+It reads the OS build number at startup — Windows 11 still reports "version 10.0", so build 22000 and above is treated as Windows 11. There's nothing to configure; the detected profile is shown on the main menu.
+
+**A menu needed `0` typed twice — is that fixed?**
+Several causes were found and fixed in v1.2.0: clicking inside a classic console window starts a text selection that swallows the next Enter (now disabled at startup); "Press Enter to continue" pauses used to eat the `0` you meant as *back* (now `0` goes back); and keystrokes typed during a slow redraw used to answer the next prompt (now discarded). If it ever recurs, note which screen you were on and whether you had clicked in the window.
+
+**OneDrive showed "NOT APPLIED" even after it was uninstalled — why?**
+That was a bug in earlier versions: the check counted a OneDrive installer file that ships with Windows itself and stays after an uninstall. Fixed in v1.2.0 — it now checks the real program, its registered uninstall entry, and any running process.
+
+**Edge says "Managed by your organization" after applying some tweaks — is that a problem?**
+No. Edge shows that label whenever a setting is applied through the policy registry path, which is how its background-mode, preload and sidebar controls are set. Reverting the tweak removes the policy.
 
 **Copilot won't fully uninstall / still shows disk usage — why?**
 On some Windows 11 builds, Copilot is a protected inbox component rather than a normal removable app, and no script can override that. The tool tries every known package name Microsoft has used across builds and disables the taskbar button either way, but tells you plainly if full removal wasn't possible rather than claiming success it can't verify.
@@ -388,9 +474,29 @@ On some Windows 11 builds, Copilot is a protected inbox component rather than a 
 
 ## Roadmap
 
-- [ ] Windows 11 compatibility pass
+- [x] Windows 10 / 11 detection with per-OS tweak profiles (v1.2.0)
+- [ ] Broader real-world testing of the Windows 11 profile
 - [ ] Config file support for unattended fleet deployment
 - [ ] Optional CSV export of applied-tweak status across machines
+
+---
+
+## Changelog
+
+**v1.2.0**
+- Added silent Windows 10 / 11 detection with per-OS tweak profiles; 18 new tweaks (#57–74), including Windows 10-only and Windows 11-only sets
+- Timer Resolution: holds correctly on Windows 11, pre-built helper for slow hardware, process tracking that can't act on a recycled PID
+- OneDrive: fixed a status check that always reported "not applied"; removal is now reversible and blocks other profiles
+- High Performance power plan is recreated if Windows hides it
+- Input handling: console text-selection mode disabled, `0` goes back at pauses, stale keystrokes discarded, no more stray pause after invalid input
+- Fixed: restore menu couldn't list exactly one save point; status screens made much faster by reading installed apps once
+
+**v1.1.0**
+- Diagnostics and Repair menu (Option D); 12 new tweaks (#45–56); Windows 7-style Global Timer Resolution; Compatibility Appraiser and OneDrive tweaks
+- Fixed the PowerShell window flashing at startup and several tweaks that checked the wrong registry path
+
+**v1.0.0**
+- Initial release
 
 ---
 

@@ -14,9 +14,6 @@ $Author   = "shivansh"
 $ScriptUrl = "PUT_YOUR_RAW_SCRIPT_URL_HERE"
 
 # ---- Self-elevate if not running as Administrator ----
-# (Right-click "Run with PowerShell" does NOT run elevated, and closes the
-#  window the instant the script exits/errors - this reopens an elevated
-#  window that stays open with -NoExit, and shows the UAC prompt for you.)
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "Requesting administrator privileges..." -ForegroundColor Yellow
@@ -24,7 +21,6 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
         if ($PSCommandPath) {
             Start-Process powershell.exe -ArgumentList @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"") -Verb RunAs
         } elseif ($ScriptUrl -and $ScriptUrl -notmatch 'PUT_YOUR_RAW_SCRIPT_URL_HERE') {
-            # Running via "irm <url> | iex" - no file path exists, so re-fetch and re-run in the elevated window
             $cmd = "irm '$ScriptUrl' | iex"
             Start-Process powershell.exe -ArgumentList @('-NoExit', '-ExecutionPolicy', 'Bypass', '-Command', $cmd) -Verb RunAs
         } else {
@@ -38,6 +34,33 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
         Read-Host "Press Enter to close"
     }
     exit
+}
+
+# ---- Single-instance guard ----
+# Prevents two elevated copies (double-click + logon task, or user relaunches
+# while an Apply-All is still running) from racing on:
+#   * the transcript file (Start-Transcript / Stop-Transcript on the same path)
+#   * prev.txt and UIT63-Snapshots.txt (Add-Content is not atomic)
+#   * the timer-resolution enforcer PID file
+# Placed BEFORE Start-Transcript on purpose - if a second instance can't get
+# the mutex, we don't want it opening a competing transcript on the same file.
+$Global:Uit63Mutex = $null
+try {
+    $Global:Uit63Mutex = New-Object System.Threading.Mutex($false, 'Global\UIT63-FDIV-SingleInstance')
+    $acquired = $false
+    try {
+        $acquired = $Global:Uit63Mutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        # Previous instance crashed without releasing - we now own it
+        $acquired = $true
+    }
+    if (-not $acquired) {
+        Write-Host "UIT-63 FDIV is already running in another window. Exiting to avoid conflicts." -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
+        exit
+    }
+} catch {
+    # If mutex creation fails for any reason, continue without the guard rather than abort.
 }
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -91,9 +114,6 @@ function Set-SvcState($Name, [bool]$Disable) {
             Start-Service -Name $Name -ErrorAction SilentlyContinue
         }
     } catch {
-        # Set-Service can be blocked by Windows Update / policy locks on some
-        # services (DoSvc in particular). Fall back to sc.exe, which sometimes
-        # succeeds where Set-Service is denied, and report the real reason either way.
         $mode = if ($Disable) { 'disabled' } else { 'demand' }
         $scOut = sc.exe config $Name start= $mode 2>&1
         if ($scOut -notmatch 'SUCCESS') {
@@ -103,16 +123,18 @@ function Set-SvcState($Name, [bool]$Disable) {
 }
 
 function Get-SvcDisabled($Name) {
+    # Absent service is treated as satisfied, matching Get-TaskDisabled.
+    # Without this, tweaks whose services don't exist on a given SKU (Fax,
+    # RetailDemo, MapsBroker, RemoteRegistry, PcaSvc, Xbox services, etc.)
+    # would report "NOT APPLIED" forever and be retried on every Apply-All.
     $s = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if ($s) { return ($s.StartType -eq 'Disabled') }
-    return $false
+    if (-not $s) { return $true }
+    return ($s.StartType -eq 'Disabled')
 }
 
 function Get-TaskDisabled($TaskPath, $TaskName) {
     $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($t) { return ($t.State -eq 'Disabled') }
-    # If the task doesn't exist on this Windows build, there's nothing to disable -
-    # treat that as satisfied rather than permanently "not applied".
     return $true
 }
 
@@ -131,11 +153,6 @@ function Set-TaskState($TaskPath, $TaskName, [bool]$Disable) {
 }
 
 # ---- Genuinely-hidden scheduled task launcher ----
-# "-WindowStyle Hidden" on powershell.exe is unreliable when Windows Terminal
-# is the default terminal app - it can still flash or open a visible window
-# at logon/startup. WScript.Shell.Run with window style 0 hides the window
-# at the OS level regardless of terminal settings, which is the reliable way
-# to run something via Task Scheduler with truly no visible window.
 function New-HiddenTaskAction($VbsPath, $InnerCommandLine) {
     $dir = Split-Path $VbsPath -Parent
     if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
@@ -146,32 +163,17 @@ function New-HiddenTaskAction($VbsPath, $InnerCommandLine) {
 }
 
 function Start-Hidden($InnerCommandLine) {
-    # One-off equivalent of New-HiddenTaskAction, for launching something
-    # immediately (not via a scheduled task) with a genuinely hidden window.
     $vbsPath = "$env:TEMP\uit63-hidden-launch-$([guid]::NewGuid().ToString('N')).vbs"
     $escaped = $InnerCommandLine -replace '"', '""'
     $vbs = "Set objShell = CreateObject(`"WScript.Shell`")`r`nobjShell.Run `"$escaped`", 0, False"
     Set-Content -Path $vbsPath -Value $vbs -Encoding ASCII
     $wscriptProc = Start-Process wscript.exe -ArgumentList "`"$vbsPath`"" -WindowStyle Hidden -PassThru
-    # Wait for wscript's own process to exit (it returns almost immediately
-    # after firing the non-blocking Run call) rather than a fixed sleep -
-    # more reliable on slow disk I/O where a fixed delay can race the file read.
     if ($wscriptProc) { $wscriptProc | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
     Remove-Item $vbsPath -Force -ErrorAction SilentlyContinue
 }
 
 # ---- Global Timer Resolution (Windows 7-style 8ms system tick) ----
-# Timer resolution isn't a static registry value - it's held open by a
-# running process via the multimedia timer API. Windows auto-reverts it the
-# instant that process exits. This writes a small persistent script and runs
-# it hidden, both immediately and at every logon, so 8ms stays held for as
-# long as the tweak is enabled - killing the process (done on disable)
-# releases it automatically, no separate cleanup call needed.
-#
-# Status is tracked via a PID file rather than matching process command
-# lines - CommandLine matching via CIM is unreliable across quoting
-# variations and was the cause of this tweak never reporting as applied.
 $TimerResDir = "$env:ProgramData\UIT63"
 $TimerResScript = "$TimerResDir\TimerResEnforcer.ps1"
 $TimerResPidFile = "$TimerResDir\enforcer.pid"
@@ -180,18 +182,6 @@ $TimerResTask = "UIT63-TimerResolutionEnforcer"
 function Install-TimerResolutionEnforcer {
     if (-not (Test-Path $TimerResDir)) { New-Item -Path $TimerResDir -ItemType Directory -Force | Out-Null }
 
-    # Compile the P/Invoke helper ONCE to a real .dll, rather than recompiling
-    # C# via Add-Type on every launch (every logon) - that compilation is slow
-    # on older hardware. If the DLL can't be built, the enforcer script falls
-    # back to compiling the same member definition inline.
-    #
-    # SetProcessInformation is the Windows 11 part: from Windows 11 on, a
-    # process whose window is hidden/occluded stops being guaranteed a high
-    # timer resolution. This process is exactly that (a hidden window), so it
-    # opts out of that behaviour (power-throttling class 4, IGNORE_TIMER_RESOLUTION
-    # control bit set, state bit clear). On Windows 10 the call is simply
-    # ignored. The "2" in the file name is so an older cached DLL without
-    # this method is never reused.
     $memberDef = @'
 [DllImport("winmm.dll")]
 public static extern uint timeBeginPeriod(uint uMilliseconds);
@@ -207,7 +197,16 @@ public static extern bool SetProcessInformation(IntPtr hProcess, int ProcessInfo
         }
     }
 
+    # The enforcer script now acquires a named mutex BEFORE writing its PID file.
+    # If two enforcers launch at once (scheduled task at logon + interactive
+    # Install- call), only one wins; the loser exits without writing a PID,
+    # so we never end up with an orphaned PowerShell holding a timer request
+    # that has no PID file to release it.
     $body = @'
+$__mtx = New-Object System.Threading.Mutex($false, 'Global\UIT63-TimerResEnforcer')
+$__got = $false
+try { $__got = $__mtx.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $__got = $true }
+if (-not $__got) { exit }
 $PID | Out-File -FilePath "__PIDFILE__" -Encoding ascii -Force
 if (Test-Path "__DLLPATH__") {
     Add-Type -Path "__DLLPATH__"
@@ -225,19 +224,11 @@ while ($true) { Start-Sleep -Seconds 3600 }
     $body = $body -replace '__MEMBERDEF__', $memberDef
     Set-Content -Path $TimerResScript -Value $body -Encoding UTF8
 
-    # Stop any previous instance tracked by the PID file before starting fresh
-    # Only stop a process positively identified as our own enforcer
     $old = Get-TimerEnforcerProcess
     if ($old) { Stop-Process -Id $old.Id -Force -ErrorAction SilentlyContinue }
     Remove-Item $TimerResPidFile -Force -ErrorAction SilentlyContinue
 
-    # Genuinely hidden launch (not "-WindowStyle Hidden", which is unreliable
-    # under Windows Terminal) - the script writes its own PID to the pid file
-    # as its first action, so tracking works the same way whether launched
-    # here or by the scheduled task below.
     Start-Hidden "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TimerResScript`""
-    # Poll rather than a single fixed-delay check - loading a pre-built DLL is
-    # fast, but still give this a reasonable window on slow HDD-based hardware.
     $confirmed = $false
     for ($i = 0; $i -lt 10; $i++) {
         Start-Sleep -Seconds 1
@@ -261,7 +252,6 @@ while ($true) { Start-Sleep -Seconds 3600 }
 }
 
 function Remove-TimerResolutionEnforcer {
-    # Only stop a process positively identified as our own enforcer
     $old = Get-TimerEnforcerProcess
     if ($old) { Stop-Process -Id $old.Id -Force -ErrorAction SilentlyContinue }
     Remove-Item $TimerResPidFile -Force -ErrorAction SilentlyContinue
@@ -289,9 +279,6 @@ function Set-SPI($action, [bool]$onOff) {
 }
 
 function Assert-FontSmoothingOn {
-    # Standing requirement: smooth edges of screen fonts (ClearType) stays on
-    # no matter what - called unconditionally at startup and after any action
-    # that could hand effect selection back to Windows' own auto-heuristic.
     try {
         Set-Reg "HKCU:\Control Panel\Desktop" "FontSmoothing" "2" String
         Set-Reg "HKCU:\Control Panel\Desktop" "FontSmoothingType" 2
@@ -302,10 +289,6 @@ function Assert-FontSmoothingOn {
 }
 
 function Register-FontSmoothingEnforcer {
-    # Font smoothing has been observed reverting between sessions (likely at
-    # logon, from a mechanism outside this tool's runtime). Rather than only
-    # fixing it while the tool is open, this registers a scheduled task that
-    # re-applies it at every logon regardless of whether the tool ever runs again.
     try {
         $taskName = "UIT63-FontSmoothingEnforcer"
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -321,9 +304,13 @@ function Register-FontSmoothingEnforcer {
 }
 
 function Ensure-Winget {
-    if (Test-Path "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe") {
+    # Cheap, network-free check: winget --version returns instantly.
+    # (winget upgrade with no args hits the source and can take 10-30s on
+    # first invocation on old hardware, which the old check triggered.)
+    $wingetExe = "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
+    if (Test-Path $wingetExe) {
         try {
-            winget upgrade *>$null
+            $null = & $wingetExe --version 2>$null
             if ($LASTEXITCODE -eq 0) { return $true }
         } catch {}
     }
@@ -350,10 +337,6 @@ function Ensure-Winget {
 
 # ===========================================================
 # WINDOWS GENERATION DETECTION (silent - no prompt)
-# Windows 11 still reports version 10.0, so the build number is the
-# reliable discriminator: build 22000 and above is Windows 11. Everything
-# below that depends on the OS (tweak catalog, app list, messages) reads
-# these three values.
 # ===========================================================
 $Global:WinBuild = 0
 try { $Global:WinBuild = [int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).BuildNumber } catch {}
@@ -380,14 +363,11 @@ $BundledApps = @(
     "Microsoft.Copilot","Microsoft.MicrosoftStickyNotes","Microsoft.MixedReality.Portal",
     "Microsoft.549981C3F5F10"
 )
-# Apps that only exist on one generation - the removal chain skips absent
-# packages harmlessly, but keeping the lists separate keeps Option 9 accurate.
 $BundledAppsWin11 = @("MicrosoftWindows.Client.WebExperience","Microsoft.Windows.DevHome","Microsoft.PowerAutomateDesktop","Microsoft.BingSearch")
 $BundledAppsWin10 = @("Microsoft.MSPaint")
 if ($Global:IsWin11) { $BundledApps = $BundledApps + $BundledAppsWin11 } else { $BundledApps = $BundledApps + $BundledAppsWin10 }
 $XboxServices = @('XblAuthManager','XblGameSave','XboxNetApiSvc','XboxGipSvc')
 
-# ---- Shared data for the newer tweaks ----
 $CdmPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
 $CdmValues = @(
     "ContentDeliveryAllowed","OemPreInstalledAppsEnabled","PreInstalledAppsEnabled","PreInstalledAppsEverEnabled",
@@ -410,24 +390,24 @@ $CtxMenuRoot = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2
 $CtxMenuKey = "$CtxMenuRoot\InprocServer32"
 
 function Set-HighPerformancePlan {
-    # Some installs (many Windows 11 and modern-standby systems) hide the High
-    # performance plan entirely. Recreate it under its standard GUID if missing.
-    $list = powercfg /list 2>$null | Out-String
-    if ($list -notmatch $HighPerfGuid) {
-        powercfg -duplicatescheme $HighPerfGuid $HighPerfGuid 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) { powercfg -duplicatescheme $HighPerfGuid 2>$null | Out-Null }
-    }
+    # Try to activate it first - if that succeeds the plan exists (even if
+    # hidden from powercfg /list on Windows 11). Only duplicate when the
+    # plan is genuinely absent, which avoids the "list grows by one plan
+    # every run" behaviour of the old version.
     powercfg /setactive $HighPerfGuid 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        $m = [regex]::Match((powercfg /list | Out-String), '([0-9a-fA-F-]{36})\s+\((High performance|Ultimate Performance)\)')
-        if ($m.Success) { powercfg /setactive $m.Groups[1].Value 2>$null }
-    }
+    if ($LASTEXITCODE -eq 0) { return }
+
+    powercfg -duplicatescheme $HighPerfGuid $HighPerfGuid 2>$null | Out-Null
+    powercfg /setactive $HighPerfGuid 2>$null
+    if ($LASTEXITCODE -eq 0) { return }
+
+    # Standard-GUID duplication failed - fall back to the random-GUID form
+    powercfg -duplicatescheme $HighPerfGuid 2>$null | Out-Null
+    $m = [regex]::Match((powercfg /list | Out-String), '([0-9a-fA-F-]{36})\s+\((High performance|Ultimate Performance)\)')
+    if ($m.Success) { powercfg /setactive $m.Groups[1].Value 2>$null }
 }
 
 function Test-OneDriveInstalled {
-    # Deliberately does NOT look at SysWOW64\OneDriveSetup.exe - that installer
-    # stub ships with Windows itself and stays after an uninstall, so counting
-    # it made this tweak report "not applied" forever.
     $exes = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe", "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe", "${env:ProgramFiles(x86)}\Microsoft OneDrive\OneDrive.exe")
     foreach ($e in $exes) { if ($e -and (Test-Path $e)) { return $true } }
     if (Get-OneDriveUninstallString) { return $true }
@@ -435,9 +415,34 @@ function Test-OneDriveInstalled {
     return $false
 }
 
+# ---- PCIe ASPM helpers ----
+# Setting GUIDs are stable across Windows builds; only the label text is localized.
+$PcieSubGuid = '501a4d13-42af-4429-9fd1-a8218c268e20'
+$PcieAspmGuid = 'ee12f906-d277-404b-b6da-e5fa1a576df5'
+function Get-ActivePowerSchemeGuid {
+    $out = powercfg /getactivescheme 2>$null | Out-String
+    $m = [regex]::Match($out, '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
+    if ($m.Success) { return $m.Groups[1].Value.ToLower() }
+    return $null
+}
+function Test-PcieAspmOff {
+    # Reads the current active scheme's user override for ASPM. If there is
+    # no override the factory default applies - which on most schemes is 1
+    # (Moderate power savings), not 0 - so an absent value counts as
+    # "not applied" and the tweak is correctly shown as available to apply.
+    try {
+        $guid = Get-ActivePowerSchemeGuid
+        if (-not $guid) { return $false }
+        $path = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\$guid\$PcieSubGuid\$PcieAspmGuid"
+        $ac = Get-RegValue $path "ACSettingIndex"
+        return ($ac -eq 0)
+    } catch { return $false }
+}
+
 # ===========================================================
 # TWEAK CATALOG  (Id -> Name / Tier)
-# Tier: Base = always part of "Apply All"; RAM4GB = extra tier
+# Tier: Base = always part of "Apply All"; RAM4GB = extra tier;
+#       Optional = only via the individual toggle menu
 # ===========================================================
 $TweakInfo = @{
     1  = @{ Name = "SysMain (Superfetch) service";               Tier = "Base" }
@@ -464,7 +469,7 @@ $TweakInfo = @{
     22 = @{ Name = "Power plan - High Performance";               Tier = "Base" }
     23 = @{ Name = "Custom visual effects (fonts/anim/shadow kept)"; Tier = "Base" }
     24 = @{ Name = "Transparency effects - off";                  Tier = "Base" }
-    25 = @{ Name = "Explorer thumbnails - off (icons only)";      Tier = "Base" }
+    25 = @{ Name = "Explorer thumbnails - off (icons only)";      Tier = "Optional" }
     26 = @{ Name = "Hibernation - off";                            Tier = "Base" }
     27 = @{ Name = "Bundled apps removed (Xbox/Teams/Clipchamp/etc)"; Tier = "Base" }
     28 = @{ Name = "Program Compatibility Assistant - off";       Tier = "RAM4GB" }
@@ -511,15 +516,15 @@ $TweakInfo = @{
     69 = @{ Name = "Widgets - off"; Tier = "Base"; OS = "11" }
     70 = @{ Name = "Chat (Teams) taskbar icon - off"; Tier = "Base"; OS = "11" }
     71 = @{ Name = "Taskbar Task View button and Search box - hidden"; Tier = "Base"; OS = "11" }
-    72 = @{ Name = "Classic right-click context menu restored"; Tier = "Base"; OS = "11" }
+    72 = @{ Name = "Classic right-click context menu restored"; Tier = "Optional"; OS = "11" }
     73 = @{ Name = "Start menu recommendations and tracking - off"; Tier = "Base"; OS = "11" }
     74 = @{ Name = "Recall / AI snapshot policy - off"; Tier = "Base"; OS = "11" }
+    75 = @{ Name = "Windows Search Indexer (WSearch) - off"; Tier = "Optional" }
+    76 = @{ Name = "Defender scheduled scan task - off"; Tier = "Optional" }
+    77 = @{ Name = "PCIe ASPM - off (link power saving)"; Tier = "Base" }
+    78 = @{ Name = "CPU scheduling - foreground priority boost"; Tier = "Base" }
 }
 
-# Drop tweaks that don't apply to the Windows generation this machine is
-# running. Every menu, bulk action, status list and save point iterates
-# $TweakInfo, so removing entries here is all that's needed - no other code
-# has to know about the OS split. Ids stay stable across generations.
 foreach ($k in @($TweakInfo.Keys)) {
     $req = $TweakInfo[$k].OS
     if ($req -and ((($req -eq "11") -and (-not $Global:IsWin11)) -or (($req -eq "10") -and $Global:IsWin11))) {
@@ -698,6 +703,10 @@ function Test-TweakApplied($Id) {
             return ((Get-RegValue $adv "Start_TrackDocs") -eq 0) -and ((Get-RegValue $adv "Start_IrisRecommendations") -eq 0)
         }
         74 { return (Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis") -eq 1 }
+        75 { return Get-SvcDisabled 'WSearch' }
+        76 { return Get-TaskDisabled "\Microsoft\Windows\Windows Defender\" "Windows Defender Scheduled Scan" }
+        77 { return Test-PcieAspmOff }
+        78 { return (Get-RegValue "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation") -eq 26 }
     }
     return $false
 }
@@ -740,16 +749,16 @@ function Enable-Tweak($Id) {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" "VisualFXSetting" 3
             Set-Reg "HKCU:\Control Panel\Desktop" "FontSmoothing" "2" String
             Set-Reg "HKCU:\Control Panel\Desktop" "FontSmoothingType" 2
-            Set-SPI 0x004B $true    # font smoothing
-            Set-SPI 0x1043 $true    # animate controls
-            Set-SPI 0x1025 $true    # window shadows
+            Set-SPI 0x004B $true
+            Set-SPI 0x1043 $true
+            Set-SPI 0x1025 $true
             Set-Reg "HKCU:\Control Panel\Desktop\WindowMetrics" "MinAnimate" "0" String
-            Set-SPI 0x1003 $false   # menu animation
-            Set-SPI 0x1013 $false   # menu fade
-            Set-SPI 0x1015 $false   # selection fade
-            Set-SPI 0x1005 $false   # combo box animation
-            Set-SPI 0x1007 $false   # listbox smooth scroll
-            Set-SPI 0x101B $false   # cursor shadow
+            Set-SPI 0x1003 $false
+            Set-SPI 0x1013 $false
+            Set-SPI 0x1015 $false
+            Set-SPI 0x1005 $false
+            Set-SPI 0x1007 $false
+            Set-SPI 0x101B $false
         }
         24 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency" 0 }
         25 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "IconsOnly" 1 }
@@ -759,9 +768,6 @@ function Enable-Tweak($Id) {
         }
         27 {
             foreach ($app in $BundledApps) {
-                # Try current-user scope first - this is the method that reliably
-                # succeeds (matches the reference script's proven approach).
-                # -AllUsers is a stricter operation that fails far more often.
                 try {
                     $pkg = Get-AppxPackage -Name $app -ErrorAction SilentlyContinue
                     if ($pkg) { $pkg | Remove-AppxPackage -ErrorAction SilentlyContinue }
@@ -772,7 +778,6 @@ function Enable-Tweak($Id) {
                     if ($prov) { $prov | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null }
                 } catch {}
 
-                # Still present? Try -AllUsers scope as a second attempt.
                 if (Get-AppxPackage -Name $app -ErrorAction SilentlyContinue) {
                     try {
                         $pkgAll = Get-AppxPackage -Name $app -AllUsers -ErrorAction SilentlyContinue
@@ -780,8 +785,6 @@ function Enable-Tweak($Id) {
                     } catch {}
                 }
 
-                # Still present after both AppX methods? Fall back to winget,
-                # bootstrapping it lazily only if we actually need it.
                 if (Get-AppxPackage -Name $app -ErrorAction SilentlyContinue) {
                     if ($null -eq $Global:WingetOk) { $Global:WingetOk = Ensure-Winget }
                     if ($Global:WingetOk) {
@@ -803,9 +806,19 @@ function Enable-Tweak($Id) {
             $cs = Get-WmiObject Win32_ComputerSystem
             $cs.AutomaticManagedPagefile = $false
             $cs.Put() | Out-Null
-            $pf = Get-WmiObject Win32_PageFileSetting
-            if ($pf) { $pf.InitialSize = 4096; $pf.MaximumSize = 8192; $pf.Put() | Out-Null }
-            else { Set-WmiInstance -Class Win32_PageFileSetting -Arguments @{ Name = "$env:SystemDrive\pagefile.sys"; InitialSize = 4096; MaximumSize = 8192 } | Out-Null }
+            # Iterate over every existing pagefile rather than assuming one.
+            # On a system with more than one, $pf is an array and assigning
+            # to .InitialSize on the array silently fails.
+            $pfs = @(Get-WmiObject Win32_PageFileSetting)
+            if ($pfs.Count -gt 0) {
+                foreach ($pf in $pfs) {
+                    $pf.InitialSize = 4096
+                    $pf.MaximumSize = 8192
+                    $pf.Put() | Out-Null
+                }
+            } else {
+                Set-WmiInstance -Class Win32_PageFileSetting -Arguments @{ Name = "$env:SystemDrive\pagefile.sys"; InitialSize = 4096; MaximumSize = 8192 } | Out-Null
+            }
         }
         31 {
             fsutil behavior set disablelastaccess 1 | Out-Null
@@ -877,13 +890,9 @@ function Enable-Tweak($Id) {
             }
 
             if (-not $triggered) {
-                # Fallback: no registry uninstall entry found, try known common paths
                 $paths = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe", "$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
                 foreach ($path in $paths) {
                     if (Test-Path $path) {
-                        # No -Wait: OneDriveSetup.exe /uninstall hands off to a detached
-                        # child process and returns almost immediately - waiting on the
-                        # parent doesn't actually wait for the uninstall to finish.
                         try { Start-Process $path -ArgumentList "/uninstall" -ErrorAction Stop; $triggered = $true }
                         catch { Write-Host "  OneDrive uninstall failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
                     }
@@ -891,18 +900,20 @@ function Enable-Tweak($Id) {
             }
 
             if ($triggered) {
+                # Wait for the setup process to exit rather than a fixed 8s.
+                # On slow HDD with a large cloud cache, uninstall can take >8s
+                # and force-removing its directory while setup is still running
+                # reliably fails on locked files.
                 Write-Host "  Waiting for OneDrive's uninstaller to finish..." -ForegroundColor DarkGray
-                Start-Sleep -Seconds 8
+                $setupProc = Get-Process OneDriveSetup -ErrorAction SilentlyContinue
+                if ($setupProc) { $setupProc | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue }
+                Start-Sleep -Milliseconds 500
             } else {
                 Write-Host "  Could not find any OneDrive uninstaller (registry or known paths) - it may already be removed, or installed in an unrecognized location." -ForegroundColor DarkYellow
             }
             Get-Process OneDriveSetup -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-            # The uninstaller's own self-cleanup is known to behave inconsistently
-            # when launched from an elevated context (which this tool always runs
-            # in). Rather than trust that it finished, force-remove what's left
-            # directly - we already have the rights to do this reliably.
             $leftoverPaths = @(
                 "$env:LOCALAPPDATA\Microsoft\OneDrive",
                 "$env:ProgramData\Microsoft OneDrive",
@@ -917,7 +928,6 @@ function Enable-Tweak($Id) {
             Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "OneDrive*" } | ForEach-Object {
                 Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
             }
-            # Also stop OneDrive from running for any other (or future) profile on this PC
             Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" 1
         }
         45 {
@@ -1061,6 +1071,29 @@ function Enable-Tweak($Id) {
             Set-Reg $adv "Start_AccountNotifications" 0
         }
         74 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1 }
+        75 {
+            Set-SvcState 'WSearch' $true
+            Write-Host "  Windows Search Indexer stopped. Start menu file search will be slow until it is re-enabled." -ForegroundColor Yellow
+        }
+        76 {
+            Set-TaskState "\Microsoft\Windows\Windows Defender\" "Windows Defender Scheduled Scan" $true
+            Write-Host "  Defender scheduled scan task disabled. Real-time protection is unchanged." -ForegroundColor Yellow
+        }
+        77 {
+            $guid = Get-ActivePowerSchemeGuid
+            if ($guid) {
+                powercfg /setacvalueindex $guid $PcieSubGuid $PcieAspmGuid 0 2>$null
+                powercfg /setdcvalueindex $guid $PcieSubGuid $PcieAspmGuid 0 2>$null
+                powercfg /setactive $guid 2>$null
+                Write-Host "  PCIe ASPM disabled on the active power plan." -ForegroundColor Green
+            } else {
+                Write-Host "  Could not determine the active power plan GUID." -ForegroundColor DarkYellow
+            }
+        }
+        78 {
+            Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation" 26
+            Write-Host "  Foreground window now gets a larger CPU quantum." -ForegroundColor Green
+        }
     }
 }
 
@@ -1107,9 +1140,6 @@ function Disable-Tweak($Id) {
             Set-SPI 0x1005 $true
             Set-SPI 0x1007 $true
             Set-SPI 0x101B $true
-            # VisualFXSetting=0 hands effect selection to Windows' own auto-heuristic,
-            # which can decide to turn font smoothing off on low-spec hardware. Force
-            # it back on explicitly so it's never left to that heuristic.
             Assert-FontSmoothingOn
         }
         24 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize" "EnableTransparency" 1 }
@@ -1172,7 +1202,6 @@ function Disable-Tweak($Id) {
         43 { Set-TaskState "\Microsoft\Windows\Application Experience\" "Microsoft Compatibility Appraiser" $false }
         44 {
             Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC"
-            # Windows keeps its own copy of the OneDrive installer, so this can be reversed
             $stub = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
             if (-not (Test-Path $stub)) { $stub = "$env:SystemRoot\System32\OneDriveSetup.exe" }
             if (Test-Path $stub) {
@@ -1292,19 +1321,37 @@ function Disable-Tweak($Id) {
             Set-Reg $adv "Start_AccountNotifications" 1
         }
         74 { Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" }
+        75 {
+            Set-SvcState 'WSearch' $false
+            Write-Host "  Windows Search Indexer re-enabled." -ForegroundColor Green
+        }
+        76 {
+            Set-TaskState "\Microsoft\Windows\Windows Defender\" "Windows Defender Scheduled Scan" $false
+            Write-Host "  Defender scheduled scan task re-enabled." -ForegroundColor Green
+        }
+        77 {
+            $guid = Get-ActivePowerSchemeGuid
+            if ($guid) {
+                # 1 = Moderate power savings, the standard default for ASPM
+                powercfg /setacvalueindex $guid $PcieSubGuid $PcieAspmGuid 1 2>$null
+                powercfg /setdcvalueindex $guid $PcieSubGuid $PcieAspmGuid 1 2>$null
+                powercfg /setactive $guid 2>$null
+                Write-Host "  PCIe ASPM reverted to Moderate power savings." -ForegroundColor Green
+            } else {
+                Write-Host "  Could not determine the active power plan GUID." -ForegroundColor DarkYellow
+            }
+        }
+        78 {
+            # 2 = Windows client default (short, variable, foreground boost)
+            Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation" 2
+            Write-Host "  Win32PrioritySeparation reverted to Windows default (2)." -ForegroundColor Green
+        }
     }
 }
 
 # ===========================================================
 # UI
 # ===========================================================
-# ---- Make the console bigger and easier to read ----
-# ---- Input handling ----
-# Anything typed while a slow screen is still redrawing sits in the console's
-# input buffer and then answers whatever prompt appears next (a stray Enter
-# dismisses a "Press Enter" pause; a stray 0 backs out of a menu). Draining the
-# buffer right before each prompt means a prompt only ever sees what was typed
-# in response to it.
 function Clear-PendingInput {
     try { while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null } } catch {}
 }
@@ -1314,17 +1361,11 @@ function Read-MenuChoice($Prompt) {
     return ("$(Read-Host $Prompt)").Trim()
 }
 
-# Returns $true when the user typed 0 - so "0" at a pause means "go back", the
-# same as everywhere else, instead of being swallowed as a plain Enter.
 function Wait-Continue($Prompt = "`nPress Enter to continue (0 = back)") {
     return ((Read-MenuChoice $Prompt) -eq '0')
 }
 
 function Disable-ConsoleQuickEdit {
-    # Classic console windows start "selecting text" the moment you click in
-    # them. While that is active the first key you press (Enter) only cancels
-    # the selection and is never delivered to the script, and output is paused -
-    # which looks exactly like a menu that needs "0" typed twice.
     try {
         Add-Type -Namespace UIT63 -Name ConMode -MemberDefinition @"
 [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
@@ -1342,9 +1383,6 @@ function Disable-ConsoleQuickEdit {
     } catch {}
 }
 
-# ---- Installed-app lookup, done once instead of once per app ----
-# Get-AppxPackage is slow (especially on an HDD). The status screens used to
-# call it ~50 times per redraw; this reads the full list once and reuses it.
 function Get-InstalledAppSet {
     if ($Global:AppxCache -and $Global:AppxCacheTime -and (((Get-Date) - $Global:AppxCacheTime).TotalSeconds -lt 30)) {
         return $Global:AppxCache
@@ -1356,11 +1394,12 @@ function Get-InstalledAppSet {
     return $set
 }
 
-# ---- Positively identify the timer-resolution enforcer process ----
-# The PID file survives reboots, so its number can later belong to an unrelated
-# process. Never act on the PID alone: it must be a PowerShell process, and
-# where the command line is readable it must be our enforcer script.
 function Get-TimerEnforcerProcess {
+    # The PID file survives reboots, so its number can later belong to an
+    # unrelated process. Never act on the PID alone: it must be a PowerShell
+    # process AND its command line must positively mention our enforcer.
+    # (The old version accepted a null CommandLine - which can happen across
+    # user contexts - and would have killed an unrelated powershell.exe.)
     if (-not (Test-Path $TimerResPidFile)) { return $null }
     $raw = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
     $n = 0
@@ -1368,7 +1407,8 @@ function Get-TimerEnforcerProcess {
     $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $n" -ErrorAction SilentlyContinue
     if (-not $cim) { return $null }
     if ($cim.Name -notlike 'powershell*') { return $null }
-    if ($cim.CommandLine -and ($cim.CommandLine -notmatch 'TimerResEnforcer')) { return $null }
+    if (-not $cim.CommandLine) { return $null }
+    if ($cim.CommandLine -notmatch 'TimerResEnforcer') { return $null }
     return (Get-Process -Id $n -ErrorAction SilentlyContinue)
 }
 
@@ -1377,14 +1417,10 @@ function Set-ConsoleReadability {
         $Host.UI.RawUI.WindowTitle = "UIT-63 FDIV Console"
     } catch {}
     try {
-        # Only widen the buffer for long lines - window size/position is left
-        # as whatever the host opened with.
         $ui = $Host.UI.RawUI
         $ui.BufferSize = New-Object System.Management.Automation.Host.Size($ui.BufferSize.Width, 3000)
     } catch {}
 
-    # Bump the font size up by exactly 1 from whatever it currently is,
-    # rather than jumping to a fixed size.
     try {
         Add-Type -TypeDefinition @"
 using System;
@@ -1421,7 +1457,6 @@ public class ConsoleFontHelper {
     } catch {}
 }
 
-# ---- System info, gathered once at startup (cheap to cache on slow HDDs) ----
 function Get-SystemInfoOnce {
     $result = [PSCustomObject]@{
         OS          = "Unknown"
@@ -1502,14 +1537,24 @@ function Show-Banner {
 
 function Show-TweakList {
     param([switch]$Numbered)
-    $ids = $TweakInfo.Keys | Sort-Object
+    # Grouped by tier so section headers appear once each, not flip-flop
+    # as numeric IDs jump between tiers (Base, RAM4GB, Base...).
+    $tierRank = @{ 'Base' = 0; 'RAM4GB' = 1; 'Optional' = 2 }
+    $ids = $TweakInfo.Keys | Sort-Object -Property `
+        @{ Expression = { $tierRank[$TweakInfo[$_].Tier] } }, `
+        @{ Expression = { [int]$_ } }
     Write-Host "  Reading the current status of each tweak - this can take a few seconds on older PCs..." -ForegroundColor DarkGray
     $currentTier = ""
     foreach ($id in $ids) {
         $info = $TweakInfo[$id]
         if ($info.Tier -ne $currentTier) {
             $currentTier = $info.Tier
-            $label = if ($currentTier -eq 'Base') { "-- Base tweaks --" } else { "-- 4GB RAM tweaks --" }
+            $label = switch ($currentTier) {
+                'Base'     { "-- Base tweaks --" }
+                'RAM4GB'   { "-- 4GB RAM tweaks --" }
+                'Optional' { "-- Optional tweaks (not applied by Apply All / Apply 4GB) --" }
+                default    { "-- $currentTier --" }
+            }
             Write-Host "`n  $label" -ForegroundColor White
         }
         $applied = Test-TweakApplied $id
@@ -1537,11 +1582,6 @@ function Get-Snapshots {
 }
 
 function Register-PhotoViewerApplication {
-    # This registers Windows Photo Viewer as an actual selectable Application
-    # (HKCR\Applications\photoviewer.dll) - without this, it may not appear as
-    # a choice at all on some Windows 10 builds, even though its file
-    # association ProgIDs already exist. This is separate from - and a
-    # prerequisite for - the default-association step that follows.
     if (-not (Get-PSDrive -Name HKCR -ErrorAction SilentlyContinue)) {
         New-PSDrive -Name HKCR -PSProvider Registry -Root HKEY_CLASSES_ROOT -Scope Script | Out-Null
     }
@@ -1560,8 +1600,6 @@ function Register-PhotoViewerApplication {
 }
 
 function Set-PhotoViewerDefault {
-    # Diagnose the two most likely reasons this fails outright, before
-    # attempting anything, so the failure reason is visible rather than silent.
     $dllPath = "$env:ProgramFiles\Windows Photo Viewer\PhotoViewer.dll"
     if (-not (Test-Path $dllPath)) {
         Write-Host "  PROBLEM FOUND: $dllPath does not exist on this machine." -ForegroundColor Red
@@ -1586,11 +1624,6 @@ function Set-PhotoViewerDefault {
 
     Register-PhotoViewerApplication
 
-    # The GPO-driven "default associations configuration file" mechanism -
-    # this re-applies at every logon via the policy engine, which is the
-    # one channel that actually overrides an EXISTING user's default app
-    # choice (the one-shot DISM import only reliably works for brand-new
-    # profiles since Windows 10 1809, by design - it won't touch this profile).
     $configDir = "$env:ProgramData\UIT63"
     $xmlPath = "$configDir\DefaultAppAssociations.xml"
     $backupPath = "$env:USERPROFILE\Desktop\UIT63-DefaultPhotoApp-Backup.xml"
@@ -1608,11 +1641,8 @@ function Set-PhotoViewerDefault {
     $xml = "<?xml version=`"1.0`" encoding=`"UTF-8`"?>`n<DefaultAssociations>`n$($lines -join "`n")`n</DefaultAssociations>"
     Set-Content -Path $xmlPath -Value $xml -Encoding UTF8
 
-    # Also try the one-shot DISM import - harmless, and helps on fresh profiles
     try { dism /Online /Import-DefaultAppAssociations:"$xmlPath" 2>$null | Out-Null } catch {}
 
-    # The part that actually sticks on an existing profile: point the policy
-    # at our XML so Windows re-applies it every logon.
     Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "DefaultAssociationsConfiguration" $xmlPath String
 
     try { gpupdate /target:computer /force *>$null } catch {}
@@ -1624,7 +1654,6 @@ function Set-PhotoViewerDefault {
 }
 
 function Restore-PhotosAppDefault {
-    # Remove the policy so Windows stops re-forcing Photo Viewer at each logon
     Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "DefaultAssociationsConfiguration"
     try { gpupdate /target:computer /force *>$null } catch {}
 
@@ -1637,17 +1666,13 @@ function Restore-PhotosAppDefault {
 }
 
 function Register-DnsEnforcer($Primary, $Secondary, $Label) {
-    # DNS settings can be lost across reboots on some hardware (interface
-    # index renumbering on driver reinit, or a router/domain policy
-    # re-asserting DNS at boot). Rather than diagnose which one applies here,
-    # this reapplies the chosen DNS at every startup, running as SYSTEM so it
-    # works even before anyone logs in. Running as SYSTEM/ServiceAccount also
-    # means this executes in Session 0, isolated from the desktop - it was
-    # never able to show a visible window, unlike the AtLogOn tasks below.
     try {
         $taskName = "UIT63-DnsEnforcer"
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        $innerCmd = "Get-NetAdapter | Where-Object { `$_.Status -eq 'Up' } | ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex `$_.IfIndex -ServerAddresses ('$Primary','$Secondary') }"
+        # AtStartup can fire before the network adapter is up. Retry for up to
+        # 10 minutes inside the command so DNS is eventually applied rather than
+        # silently skipped on the first boot.
+        $innerCmd = "`$ok=`$false; for(`$i=0; `$i -lt 40 -and -not `$ok; `$i++){ `$ads=@(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { `$_.Status -eq 'Up' }); if(`$ads.Count -gt 0){ foreach(`$a in `$ads){ try{ Set-DnsClientServerAddress -InterfaceIndex `$a.IfIndex -ServerAddresses ('$Primary','$Secondary') -ErrorAction Stop; `$ok=`$true } catch {} } }; if(-not `$ok){ Start-Sleep -Seconds 15 } }"
         $fullCmd = "powershell.exe -NoProfile -WindowStyle Hidden -Command `"$innerCmd`""
         $vbsPath = "$env:ProgramData\UIT63\DnsEnforcerLauncher.vbs"
         $action = New-HiddenTaskAction $vbsPath $fullCmd
@@ -1665,13 +1690,17 @@ function Remove-DnsEnforcer {
 }
 
 function Remove-AllUit63Tasks {
-    # Full cleanup of every background scheduled task this tool has ever
-    # registered, across any version - the escape hatch for someone who
-    # doesn't remember which specific tweak to re-toggle after an update.
     try { Remove-TimerResolutionEnforcer } catch {}
+    # Fallback: if the PID file is corrupted or missing, still hunt down any
+    # orphaned enforcer processes by command line so they can't hold an 8ms
+    # timer forever after the task is gone.
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -match 'TimerResEnforcer' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
     try { Remove-DnsEnforcer } catch {}
     try { Unregister-ScheduledTask -TaskName "UIT63-FontSmoothingEnforcer" -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-    # Catch-all sweep in case a task name changed across versions or isn't covered above
     try {
         Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "UIT63-*" } | ForEach-Object {
             Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -1680,10 +1709,6 @@ function Remove-AllUit63Tasks {
 }
 
 function Get-OneDriveUninstallString {
-    # Reads Windows' own registered uninstall command for OneDrive - the same
-    # place Control Panel's "Uninstall a program" reads from. More reliable
-    # than guessing install paths, since Microsoft has changed OneDrive's
-    # install location and packaging more than once over the years.
     $searchPaths = @(
         "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -1968,7 +1993,6 @@ function Menu-Restore {
             return
         }
 
-        # Show most recent first
         $indexed = @()
         for ($i = 0; $i -lt $snapshots.Count; $i++) { $indexed += , @($i, $snapshots[$i]) }
         $indexed = $indexed | Sort-Object { $_[0] } -Descending
@@ -2025,7 +2049,19 @@ function Menu-Restore {
 function Ensure-RestorePoint {
     try {
         Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
+        # Windows normally rate-limits restore points to one per 24h. That
+        # silently no-ops every call after the first, so the "checkpoint before
+        # every action" promise is empty. Bypass the cooldown for this one
+        # call, then restore the previous setting.
+        $srKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
+        $prevFreq = Get-RegValue $srKey "SystemRestorePointCreationFrequency"
+        Set-Reg $srKey "SystemRestorePointCreationFrequency" 0
         Checkpoint-Computer -Description "UIT63-EduBoost" -RestorePointType "MODIFY_SETTINGS" -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+        if ($null -ne $prevFreq) {
+            Set-Reg $srKey "SystemRestorePointCreationFrequency" $prevFreq
+        } else {
+            Remove-Reg $srKey "SystemRestorePointCreationFrequency"
+        }
     } catch {}
 }
 

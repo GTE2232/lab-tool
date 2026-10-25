@@ -8,9 +8,7 @@ $ToolName = "UIT-63 - FDIV Edition"
 $Author   = "shivansh"
 
 # If you deploy this via:  irm https://your-host/UIT-63-FDIV.ps1 | iex
-# set this to that exact raw URL. It's needed because a script run through
-# "irm | iex" has no file on disk, so self-elevation can't just relaunch a
-# file path - it needs to re-download and re-run itself in the new window.
+# set this to that exact raw URL.
 $ScriptUrl = "PUT_YOUR_RAW_SCRIPT_URL_HERE"
 
 # ---- Self-elevate if not running as Administrator ----
@@ -37,13 +35,6 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 }
 
 # ---- Single-instance guard ----
-# Prevents two elevated copies (double-click + logon task, or user relaunches
-# while an Apply-All is still running) from racing on:
-#   * the transcript file (Start-Transcript / Stop-Transcript on the same path)
-#   * prev.txt and UIT63-Snapshots.txt (Add-Content is not atomic)
-#   * the timer-resolution enforcer PID file
-# Placed BEFORE Start-Transcript on purpose - if a second instance can't get
-# the mutex, we don't want it opening a competing transcript on the same file.
 $Global:Uit63Mutex = $null
 try {
     $Global:Uit63Mutex = New-Object System.Threading.Mutex($false, 'Global\UIT63-FDIV-SingleInstance')
@@ -51,7 +42,6 @@ try {
     try {
         $acquired = $Global:Uit63Mutex.WaitOne(0)
     } catch [System.Threading.AbandonedMutexException] {
-        # Previous instance crashed without releasing - we now own it
         $acquired = $true
     }
     if (-not $acquired) {
@@ -59,23 +49,18 @@ try {
         Start-Sleep -Seconds 2
         exit
     }
-} catch {
-    # If mutex creation fails for any reason, continue without the guard rather than abort.
-}
+} catch {}
 
 $ErrorActionPreference = 'SilentlyContinue'
 $LogFile = "$env:USERPROFILE\Desktop\UIT63-EduBoost-Log.txt"
 Start-Transcript -Path $LogFile -Append | Out-Null
 
-# ---- History log of what was applied/disabled and when ----
 $PrevLog = "$env:USERPROFILE\Desktop\prev.txt"
 function Write-PrevLog($line) {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Add-Content -Path $PrevLog -Value "[$timestamp] $line"
 }
 
-# ---- Save points (like a game save) - full tweak state snapshots taken
-# after every bulk action, so you can jump back to exactly how things were ----
 $SnapshotFile = "$env:USERPROFILE\Desktop\UIT63-Snapshots.txt"
 
 # ===========================================================
@@ -105,9 +90,7 @@ function Set-SvcState($Name, [bool]$Disable) {
     if (-not $s) { return }
     try {
         if ($Disable) {
-            if ($s.Status -ne 'Stopped') {
-                Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
-            }
+            if ($s.Status -ne 'Stopped') { Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue }
             Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
         } else {
             Set-Service -Name $Name -StartupType Manual -ErrorAction Stop
@@ -123,10 +106,9 @@ function Set-SvcState($Name, [bool]$Disable) {
 }
 
 function Get-SvcDisabled($Name) {
-    # Absent service is treated as satisfied, matching Get-TaskDisabled.
-    # Without this, tweaks whose services don't exist on a given SKU (Fax,
-    # RetailDemo, MapsBroker, RemoteRegistry, PcaSvc, Xbox services, etc.)
-    # would report "NOT APPLIED" forever and be retried on every Apply-All.
+    # Absent service = satisfied. Matches Get-TaskDisabled behaviour so
+    # tweaks that target services missing on some SKUs don't report as
+    # "NOT APPLIED" forever.
     $s = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $s) { return $true }
     return ($s.StartType -eq 'Disabled')
@@ -152,7 +134,6 @@ function Set-TaskState($TaskPath, $TaskName, [bool]$Disable) {
     }
 }
 
-# ---- Genuinely-hidden scheduled task launcher ----
 function New-HiddenTaskAction($VbsPath, $InnerCommandLine) {
     $dir = Split-Path $VbsPath -Parent
     if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
@@ -197,11 +178,8 @@ public static extern bool SetProcessInformation(IntPtr hProcess, int ProcessInfo
         }
     }
 
-    # The enforcer script now acquires a named mutex BEFORE writing its PID file.
-    # If two enforcers launch at once (scheduled task at logon + interactive
-    # Install- call), only one wins; the loser exits without writing a PID,
-    # so we never end up with an orphaned PowerShell holding a timer request
-    # that has no PID file to release it.
+    # The enforcer acquires a named mutex BEFORE writing its PID file, so two
+    # concurrent enforcers can never both register - one wins, the other exits.
     $body = @'
 $__mtx = New-Object System.Threading.Mutex($false, 'Global\UIT63-TimerResEnforcer')
 $__got = $false
@@ -262,7 +240,6 @@ function Test-TimerResolutionEnforcerRunning {
     return [bool](Get-TimerEnforcerProcess)
 }
 
-# P/Invoke for individual visual-effect toggles (SystemParametersInfo)
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -288,6 +265,29 @@ function Assert-FontSmoothingOn {
     }
 }
 
+# ---- One-time migration for the old "hide search box" behaviour of tweak 71 ----
+# Older builds of this tool set SearchboxTaskbarMode=0 on Windows 11 as part
+# of tweak 71, hiding the taskbar search box. The current version never hides
+# it. This runs once per machine (marker file) and only flips an existing
+# hidden 0 back to a visible 2; it does not fight a user who deliberately
+# hides the box later, because the marker makes sure we never touch it again.
+function Invoke-SearchBoxMigration {
+    if (-not $Global:IsWin11) { return }
+    $markerDir = "$env:ProgramData\UIT63"
+    $marker = "$markerDir\searchbox-migrated.marker"
+    if (Test-Path $marker) { return }
+    try {
+        $searchPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search"
+        if ((Get-RegValue $searchPath "SearchboxTaskbarMode") -eq 0) {
+            Set-Reg $searchPath "SearchboxTaskbarMode" 2
+        }
+    } catch {}
+    try {
+        if (-not (Test-Path $markerDir)) { New-Item -Path $markerDir -ItemType Directory -Force | Out-Null }
+        Set-Content -Path $marker -Value "done" -Force
+    } catch {}
+}
+
 function Register-FontSmoothingEnforcer {
     try {
         $taskName = "UIT63-FontSmoothingEnforcer"
@@ -305,8 +305,6 @@ function Register-FontSmoothingEnforcer {
 
 function Ensure-Winget {
     # Cheap, network-free check: winget --version returns instantly.
-    # (winget upgrade with no args hits the source and can take 10-30s on
-    # first invocation on old hardware, which the old check triggered.)
     $wingetExe = "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
     if (Test-Path $wingetExe) {
         try {
@@ -336,7 +334,7 @@ function Ensure-Winget {
 }
 
 # ===========================================================
-# WINDOWS GENERATION DETECTION (silent - no prompt)
+# WINDOWS GENERATION DETECTION
 # ===========================================================
 $Global:WinBuild = 0
 try { $Global:WinBuild = [int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).BuildNumber } catch {}
@@ -390,10 +388,6 @@ $CtxMenuRoot = "HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2
 $CtxMenuKey = "$CtxMenuRoot\InprocServer32"
 
 function Set-HighPerformancePlan {
-    # Try to activate it first - if that succeeds the plan exists (even if
-    # hidden from powercfg /list on Windows 11). Only duplicate when the
-    # plan is genuinely absent, which avoids the "list grows by one plan
-    # every run" behaviour of the old version.
     powercfg /setactive $HighPerfGuid 2>$null
     if ($LASTEXITCODE -eq 0) { return }
 
@@ -401,7 +395,6 @@ function Set-HighPerformancePlan {
     powercfg /setactive $HighPerfGuid 2>$null
     if ($LASTEXITCODE -eq 0) { return }
 
-    # Standard-GUID duplication failed - fall back to the random-GUID form
     powercfg -duplicatescheme $HighPerfGuid 2>$null | Out-Null
     $m = [regex]::Match((powercfg /list | Out-String), '([0-9a-fA-F-]{36})\s+\((High performance|Ultimate Performance)\)')
     if ($m.Success) { powercfg /setactive $m.Groups[1].Value 2>$null }
@@ -416,7 +409,6 @@ function Test-OneDriveInstalled {
 }
 
 # ---- PCIe ASPM helpers ----
-# Setting GUIDs are stable across Windows builds; only the label text is localized.
 $PcieSubGuid = '501a4d13-42af-4429-9fd1-a8218c268e20'
 $PcieAspmGuid = 'ee12f906-d277-404b-b6da-e5fa1a576df5'
 function Get-ActivePowerSchemeGuid {
@@ -426,10 +418,6 @@ function Get-ActivePowerSchemeGuid {
     return $null
 }
 function Test-PcieAspmOff {
-    # Reads the current active scheme's user override for ASPM. If there is
-    # no override the factory default applies - which on most schemes is 1
-    # (Moderate power savings), not 0 - so an absent value counts as
-    # "not applied" and the tweak is correctly shown as available to apply.
     try {
         $guid = Get-ActivePowerSchemeGuid
         if (-not $guid) { return $false }
@@ -515,7 +503,7 @@ $TweakInfo = @{
     68 = @{ Name = "Windows Ink Workspace - off"; Tier = "Base"; OS = "10" }
     69 = @{ Name = "Widgets - off"; Tier = "Base"; OS = "11" }
     70 = @{ Name = "Chat (Teams) taskbar icon - off"; Tier = "Base"; OS = "11" }
-    71 = @{ Name = "Taskbar Task View button and Search box - hidden"; Tier = "Base"; OS = "11" }
+    71 = @{ Name = "Taskbar Task View button - hidden"; Tier = "Base"; OS = "11" }
     72 = @{ Name = "Classic right-click context menu restored"; Tier = "Optional"; OS = "11" }
     73 = @{ Name = "Start menu recommendations and tracking - off"; Tier = "Base"; OS = "11" }
     74 = @{ Name = "Recall / AI snapshot policy - off"; Tier = "Base"; OS = "11" }
@@ -694,8 +682,7 @@ function Test-TweakApplied($Id) {
             return ($polOff -or $btnOff)
         }
         71 {
-            return ((Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton") -eq 0) -and
-                   ((Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode") -eq 0)
+            return (Get-RegValue "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton") -eq 0
         }
         72 { return (Test-Path -LiteralPath $CtxMenuKey) }
         73 {
@@ -806,9 +793,6 @@ function Enable-Tweak($Id) {
             $cs = Get-WmiObject Win32_ComputerSystem
             $cs.AutomaticManagedPagefile = $false
             $cs.Put() | Out-Null
-            # Iterate over every existing pagefile rather than assuming one.
-            # On a system with more than one, $pf is an array and assigning
-            # to .InitialSize on the array silently fails.
             $pfs = @(Get-WmiObject Win32_PageFileSetting)
             if ($pfs.Count -gt 0) {
                 foreach ($pf in $pfs) {
@@ -900,10 +884,6 @@ function Enable-Tweak($Id) {
             }
 
             if ($triggered) {
-                # Wait for the setup process to exit rather than a fixed 8s.
-                # On slow HDD with a large cloud cache, uninstall can take >8s
-                # and force-removing its directory while setup is still running
-                # reliably fails on locked files.
                 Write-Host "  Waiting for OneDrive's uninstaller to finish..." -ForegroundColor DarkGray
                 $setupProc = Get-Process OneDriveSetup -ErrorAction SilentlyContinue
                 if ($setupProc) { $setupProc | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue }
@@ -1057,7 +1037,6 @@ function Enable-Tweak($Id) {
         }
         71 {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0
-            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 0
         }
         72 {
             New-Item -Path $CtxMenuKey -Force | Out-Null
@@ -1308,7 +1287,14 @@ function Disable-Tweak($Id) {
         }
         71 {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 1
-            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 1
+            # Restore search box visibility if an older build hid it. The
+            # current version never writes SearchboxTaskbarMode=0. Only a 0
+            # gets flipped back to 2 (search box); 1/2/3 are left alone so a
+            # user's deliberate choice (icon vs box vs label) is preserved.
+            $searchPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search"
+            if ((Get-RegValue $searchPath "SearchboxTaskbarMode") -eq 0) {
+                Set-Reg $searchPath "SearchboxTaskbarMode" 2
+            }
         }
         72 {
             Remove-Item -LiteralPath $CtxMenuRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -1332,7 +1318,6 @@ function Disable-Tweak($Id) {
         77 {
             $guid = Get-ActivePowerSchemeGuid
             if ($guid) {
-                # 1 = Moderate power savings, the standard default for ASPM
                 powercfg /setacvalueindex $guid $PcieSubGuid $PcieAspmGuid 1 2>$null
                 powercfg /setdcvalueindex $guid $PcieSubGuid $PcieAspmGuid 1 2>$null
                 powercfg /setactive $guid 2>$null
@@ -1342,7 +1327,6 @@ function Disable-Tweak($Id) {
             }
         }
         78 {
-            # 2 = Windows client default (short, variable, foreground boost)
             Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation" 2
             Write-Host "  Win32PrioritySeparation reverted to Windows default (2)." -ForegroundColor Green
         }
@@ -1395,11 +1379,6 @@ function Get-InstalledAppSet {
 }
 
 function Get-TimerEnforcerProcess {
-    # The PID file survives reboots, so its number can later belong to an
-    # unrelated process. Never act on the PID alone: it must be a PowerShell
-    # process AND its command line must positively mention our enforcer.
-    # (The old version accepted a null CommandLine - which can happen across
-    # user contexts - and would have killed an unrelated powershell.exe.)
     if (-not (Test-Path $TimerResPidFile)) { return $null }
     $raw = Get-Content $TimerResPidFile -ErrorAction SilentlyContinue | Select-Object -First 1
     $n = 0
@@ -1413,9 +1392,7 @@ function Get-TimerEnforcerProcess {
 }
 
 function Set-ConsoleReadability {
-    try {
-        $Host.UI.RawUI.WindowTitle = "UIT-63 FDIV Console"
-    } catch {}
+    try { $Host.UI.RawUI.WindowTitle = "UIT-63 FDIV Console" } catch {}
     try {
         $ui = $Host.UI.RawUI
         $ui.BufferSize = New-Object System.Management.Automation.Host.Size($ui.BufferSize.Width, 3000)
@@ -1537,8 +1514,6 @@ function Show-Banner {
 
 function Show-TweakList {
     param([switch]$Numbered)
-    # Grouped by tier so section headers appear once each, not flip-flop
-    # as numeric IDs jump between tiers (Base, RAM4GB, Base...).
     $tierRank = @{ 'Base' = 0; 'RAM4GB' = 1; 'Optional' = 2 }
     $ids = $TweakInfo.Keys | Sort-Object -Property `
         @{ Expression = { $tierRank[$TweakInfo[$_].Tier] } }, `
@@ -1670,8 +1645,8 @@ function Register-DnsEnforcer($Primary, $Secondary, $Label) {
         $taskName = "UIT63-DnsEnforcer"
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         # AtStartup can fire before the network adapter is up. Retry for up to
-        # 10 minutes inside the command so DNS is eventually applied rather than
-        # silently skipped on the first boot.
+        # 10 minutes inside the command so DNS is eventually applied rather
+        # than silently skipped on the first boot.
         $innerCmd = "`$ok=`$false; for(`$i=0; `$i -lt 40 -and -not `$ok; `$i++){ `$ads=@(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { `$_.Status -eq 'Up' }); if(`$ads.Count -gt 0){ foreach(`$a in `$ads){ try{ Set-DnsClientServerAddress -InterfaceIndex `$a.IfIndex -ServerAddresses ('$Primary','$Secondary') -ErrorAction Stop; `$ok=`$true } catch {} } }; if(-not `$ok){ Start-Sleep -Seconds 15 } }"
         $fullCmd = "powershell.exe -NoProfile -WindowStyle Hidden -Command `"$innerCmd`""
         $vbsPath = "$env:ProgramData\UIT63\DnsEnforcerLauncher.vbs"
@@ -1691,9 +1666,6 @@ function Remove-DnsEnforcer {
 
 function Remove-AllUit63Tasks {
     try { Remove-TimerResolutionEnforcer } catch {}
-    # Fallback: if the PID file is corrupted or missing, still hunt down any
-    # orphaned enforcer processes by command line so they can't hold an 8ms
-    # timer forever after the task is gone.
     try {
         Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -and $_.CommandLine -match 'TimerResEnforcer' } |
@@ -2049,10 +2021,8 @@ function Menu-Restore {
 function Ensure-RestorePoint {
     try {
         Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
-        # Windows normally rate-limits restore points to one per 24h. That
-        # silently no-ops every call after the first, so the "checkpoint before
-        # every action" promise is empty. Bypass the cooldown for this one
-        # call, then restore the previous setting.
+        # Bypass the default 24h cooldown for this one call so every Apply
+        # really produces a restore point, then restore the previous setting.
         $srKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
         $prevFreq = Get-RegValue $srKey "SystemRestorePointCreationFrequency"
         Set-Reg $srKey "SystemRestorePointCreationFrequency" 0
@@ -2207,6 +2177,7 @@ Disable-ConsoleQuickEdit
 $Global:SysInfo = Get-SystemInfoOnce
 Assert-FontSmoothingOn
 Register-FontSmoothingEnforcer
+Invoke-SearchBoxMigration
 
 try {
     while ($true) {

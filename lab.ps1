@@ -106,9 +106,6 @@ function Set-SvcState($Name, [bool]$Disable) {
 }
 
 function Get-SvcDisabled($Name) {
-    # Absent service = satisfied. Matches Get-TaskDisabled behaviour so
-    # tweaks that target services missing on some SKUs don't report as
-    # "NOT APPLIED" forever.
     $s = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $s) { return $true }
     return ($s.StartType -eq 'Disabled')
@@ -178,8 +175,6 @@ public static extern bool SetProcessInformation(IntPtr hProcess, int ProcessInfo
         }
     }
 
-    # The enforcer acquires a named mutex BEFORE writing its PID file, so two
-    # concurrent enforcers can never both register - one wins, the other exits.
     $body = @'
 $__mtx = New-Object System.Threading.Mutex($false, 'Global\UIT63-TimerResEnforcer')
 $__got = $false
@@ -266,11 +261,6 @@ function Assert-FontSmoothingOn {
 }
 
 # ---- One-time migration for the old "hide search box" behaviour of tweak 71 ----
-# Older builds of this tool set SearchboxTaskbarMode=0 on Windows 11 as part
-# of tweak 71, hiding the taskbar search box. The current version never hides
-# it. This runs once per machine (marker file) and only flips an existing
-# hidden 0 back to a visible 2; it does not fight a user who deliberately
-# hides the box later, because the marker makes sure we never touch it again.
 function Invoke-SearchBoxMigration {
     if (-not $Global:IsWin11) { return }
     $markerDir = "$env:ProgramData\UIT63"
@@ -280,6 +270,29 @@ function Invoke-SearchBoxMigration {
         $searchPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search"
         if ((Get-RegValue $searchPath "SearchboxTaskbarMode") -eq 0) {
             Set-Reg $searchPath "SearchboxTaskbarMode" 2
+        }
+    } catch {}
+    try {
+        if (-not (Test-Path $markerDir)) { New-Item -Path $markerDir -ItemType Directory -Force | Out-Null }
+        Set-Content -Path $marker -Value "done" -Force
+    } catch {}
+}
+
+# ---- One-time migration for the old "Disable Tweak 14 sets AllowTelemetry=3" bug ----
+# A pre-fix build's Disable-Tweak 14 set AllowTelemetry=3 and left the policy
+# in place. That value keeps the Settings UI showing "managed by your
+# organization", so the user can never turn "Send optional diagnostic data"
+# on manually. Remove it once per machine. Safe on managed machines: a real
+# GPO/Intune policy will simply re-apply 3 at its next refresh.
+function Invoke-TelemetryPolicyMigration {
+    $markerDir = "$env:ProgramData\UIT63"
+    $marker = "$markerDir\telemetry-migrated.marker"
+    if (Test-Path $marker) { return }
+    try {
+        $v = Get-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry"
+        if ($v -eq 3) {
+            Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry"
+            Remove-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" "AllowTelemetry"
         }
     } catch {}
     try {
@@ -304,7 +317,6 @@ function Register-FontSmoothingEnforcer {
 }
 
 function Ensure-Winget {
-    # Cheap, network-free check: winget --version returns instantly.
     $wingetExe = "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
     if (Test-Path $wingetExe) {
         try {
@@ -429,8 +441,6 @@ function Test-PcieAspmOff {
 
 # ===========================================================
 # TWEAK CATALOG  (Id -> Name / Tier)
-# Tier: Base = always part of "Apply All"; RAM4GB = extra tier;
-#       Optional = only via the individual toggle menu
 # ===========================================================
 $TweakInfo = @{
     1  = @{ Name = "SysMain (Superfetch) service";               Tier = "Base" }
@@ -1095,7 +1105,19 @@ function Disable-Tweak($Id) {
         11 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Siuf\Rules" "NumberOfSIUFInPeriod" 1 }
         12 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "EnableActivityFeed" 1 }
         13 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "UploadUserActivities" 1 }
-        14 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 3 }
+        14 {
+            # Removing the policy value is the ONLY way to clear the
+            # "managed by your organization" banner and re-enable the
+            # Settings toggle. Setting AllowTelemetry to 3 (Full/Optional)
+            # keeps the policy in place - it just changes the value the
+            # greyed-out UI displays, so the user still can't turn optional
+            # diagnostic data on manually.
+            Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry"
+            Remove-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" "AllowTelemetry"
+            Write-Host "  Diagnostic data policy removed - the Settings toggle is user-controlled again." -ForegroundColor Green
+            Write-Host "  To actually send optional diagnostic data, open Settings > Privacy & security >" -ForegroundColor DarkGray
+            Write-Host "  Diagnostics & feedback and turn on 'Send optional diagnostic data'." -ForegroundColor DarkGray
+        }
         15 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 1 }
         16 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Privacy" "TailoredExperiencesWithDiagnosticDataEnabled" 1 }
         17 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 0 }
@@ -1107,7 +1129,15 @@ function Disable-Tweak($Id) {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "CortanaConsent" 1
         }
         19 { Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy" "01" 1 }
-        20 { Set-Reg $hvciPath "Enabled" 1 }
+        20 {
+            # Do NOT force Enabled=1 here: Win10's default is OFF and forcing
+            # it on for a user who never had HVCI enabled is a surprise
+            # performance hit on old hardware. Removing the value lets
+            # Windows apply the SKU/version default (which for stock Win10
+            # is OFF, and for enterprise SKUs that had it ON originally is
+            # restored by Windows itself).
+            Remove-Reg $hvciPath "Enabled"
+        }
         21 { Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsRunInBackground" 0 }
         22 { powercfg /setactive SCHEME_BALANCED }
         23 {
@@ -1250,10 +1280,15 @@ function Disable-Tweak($Id) {
             Remove-Reg $ep "EdgeShoppingAssistantEnabled"
         }
         62 {
-            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchTo" 2
-            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "ShowRecent" 1
-            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "ShowFrequent" 1
-            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "ShowCloudFilesInQuickAccess" 1
+            # Remove rather than force: Win10's default LaunchTo is 2 (Quick
+            # Access) but Win11's default is 1 (Home). Forcing 2 would
+            # switch Win11 users' start folder away from their OS default.
+            $adv = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            $exp = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer"
+            Remove-Reg $adv "LaunchTo"
+            Remove-Reg $exp "ShowRecent"
+            Remove-Reg $exp "ShowFrequent"
+            Remove-Reg $exp "ShowCloudFilesInQuickAccess"
         }
         63 { foreach ($t in $TelemetryTasks) { Set-TaskState $t[0] $t[1] $false } }
         64 {
@@ -1279,18 +1314,17 @@ function Disable-Tweak($Id) {
         68 { Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\WindowsInkWorkspace" "AllowWindowsInkWorkspace" }
         69 {
             Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests"
-            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 1
+            # Remove rather than force 1: Win11 22H2+ factory default is 0.
+            Remove-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa"
         }
         70 {
             Remove-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Chat" "ChatIcon"
-            Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 1
+            # Remove rather than force 1: Win11 22H2+ has no Chat button, so
+            # TaskbarMn=1 does nothing there and shows a stale icon on 21H2.
+            Remove-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn"
         }
         71 {
             Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 1
-            # Restore search box visibility if an older build hid it. The
-            # current version never writes SearchboxTaskbarMode=0. Only a 0
-            # gets flipped back to 2 (search box); 1/2/3 are left alone so a
-            # user's deliberate choice (icon vs box vs label) is preserved.
             $searchPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search"
             if ((Get-RegValue $searchPath "SearchboxTaskbarMode") -eq 0) {
                 Set-Reg $searchPath "SearchboxTaskbarMode" 2
@@ -1640,21 +1674,22 @@ function Restore-PhotosAppDefault {
     Write-Host "  default (Photos app) to take effect again." -ForegroundColor Green
 }
 
-function Register-DnsEnforcer($Primary, $Secondary, $Label) {
+function Register-DnsEnforcer($PrimaryV4, $SecondaryV4, $PrimaryV6, $SecondaryV6, $Label) {
     try {
         $taskName = "UIT63-DnsEnforcer"
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        # AtStartup can fire before the network adapter is up. Retry for up to
-        # 10 minutes inside the command so DNS is eventually applied rather
-        # than silently skipped on the first boot.
-        $innerCmd = "`$ok=`$false; for(`$i=0; `$i -lt 40 -and -not `$ok; `$i++){ `$ads=@(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { `$_.Status -eq 'Up' }); if(`$ads.Count -gt 0){ foreach(`$a in `$ads){ try{ Set-DnsClientServerAddress -InterfaceIndex `$a.IfIndex -ServerAddresses ('$Primary','$Secondary') -ErrorAction Stop; `$ok=`$true } catch {} } }; if(-not `$ok){ Start-Sleep -Seconds 15 } }"
+        # AtStartup can fire before the network adapter is up. Retry for up
+        # to 10 minutes inside the command so DNS is eventually applied.
+        # Both IPv4 and IPv6 lists are set; if the single mixed call fails on
+        # an older PowerShell build, fall back to one call per family.
+        $innerCmd = "`$ok=`$false; for(`$i=0; `$i -lt 40 -and -not `$ok; `$i++){ `$ads=@(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { `$_.Status -eq 'Up' }); if(`$ads.Count -gt 0){ foreach(`$a in `$ads){ `$set=`$false; try{ Set-DnsClientServerAddress -InterfaceIndex `$a.IfIndex -ServerAddresses ('$PrimaryV4','$SecondaryV4','$PrimaryV6','$SecondaryV6') -ErrorAction Stop; `$set=`$true } catch { try{ Set-DnsClientServerAddress -InterfaceIndex `$a.IfIndex -ServerAddresses ('$PrimaryV4','$SecondaryV4') -ErrorAction Stop; Set-DnsClientServerAddress -InterfaceIndex `$a.IfIndex -ServerAddresses ('$PrimaryV6','$SecondaryV6') -ErrorAction Stop; `$set=`$true } catch {} }; if(`$set){ `$ok=`$true } } }; if(-not `$ok){ Start-Sleep -Seconds 15 } }"
         $fullCmd = "powershell.exe -NoProfile -WindowStyle Hidden -Command `"$innerCmd`""
         $vbsPath = "$env:ProgramData\UIT63\DnsEnforcerLauncher.vbs"
         $action = New-HiddenTaskAction $vbsPath $fullCmd
         $trigger = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal `
-            -Description "UIT-63 FDIV: keeps DNS set to $Label at every boot" -Force | Out-Null
+            -Description "UIT-63 FDIV: keeps DNS set to $Label (IPv4+IPv6) at every boot" -Force | Out-Null
     } catch {
         Write-Host "  Could not register DNS enforcer task: $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
@@ -1694,15 +1729,29 @@ function Get-OneDriveUninstallString {
     return $null
 }
 
-function Set-DnsProvider($Primary, $Secondary, $Label) {
+function Set-DnsProvider($PrimaryV4, $SecondaryV4, $PrimaryV6, $SecondaryV6, $Label) {
     $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
     if (-not $adapters) { Write-Host "  No active network adapter found." -ForegroundColor DarkGray; return }
     foreach ($a in $adapters) {
-        try { Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ServerAddresses ($Primary, $Secondary) -ErrorAction Stop }
-        catch { Write-Host "  Could not set DNS on $($a.Name): $($_.Exception.Message)" -ForegroundColor DarkYellow }
+        # One call with all four addresses sets both the IPv4 and IPv6
+        # server lists. Some older PowerShell builds only handle one family
+        # per call, so fall back to two calls.
+        try {
+            Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex `
+                -ServerAddresses @($PrimaryV4, $SecondaryV4, $PrimaryV6, $SecondaryV6) -ErrorAction Stop
+        } catch {
+            try {
+                Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ServerAddresses @($PrimaryV4, $SecondaryV4) -ErrorAction Stop
+            } catch { Write-Host "  Could not set IPv4 DNS on $($a.Name): $($_.Exception.Message)" -ForegroundColor DarkYellow }
+            try {
+                Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ServerAddresses @($PrimaryV6, $SecondaryV6) -ErrorAction Stop
+            } catch { Write-Host "  Could not set IPv6 DNS on $($a.Name): $($_.Exception.Message)" -ForegroundColor DarkYellow }
+        }
     }
-    Register-DnsEnforcer $Primary $Secondary $Label
-    Write-Host "  DNS set to $Label ($Primary, $Secondary) on active adapter(s)." -ForegroundColor Green
+    Register-DnsEnforcer $PrimaryV4 $SecondaryV4 $PrimaryV6 $SecondaryV6 $Label
+    Write-Host "  DNS set to $Label on active adapter(s):" -ForegroundColor Green
+    Write-Host "    IPv4: $PrimaryV4, $SecondaryV4" -ForegroundColor DarkGray
+    Write-Host "    IPv6: $PrimaryV6, $SecondaryV6" -ForegroundColor DarkGray
     Write-Host "  Also registered a startup task to reapply this at every boot, in case it doesn't persist on its own." -ForegroundColor DarkGray
 }
 
@@ -1710,11 +1759,13 @@ function Reset-DnsAutomatic {
     $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
     if (-not $adapters) { Write-Host "  No active network adapter found." -ForegroundColor DarkGray; return }
     foreach ($a in $adapters) {
+        # -ResetServerAddresses with no -ServerAddresses resets BOTH IPv4
+        # and IPv6 DNS lists on the adapter, so no family split needed.
         try { Set-DnsClientServerAddress -InterfaceIndex $a.IfIndex -ResetServerAddresses -ErrorAction Stop }
         catch { Write-Host "  Could not reset DNS on $($a.Name): $($_.Exception.Message)" -ForegroundColor DarkYellow }
     }
     Remove-DnsEnforcer
-    Write-Host "  DNS reset to automatic (DHCP) on active adapter(s)." -ForegroundColor Green
+    Write-Host "  DNS reset to automatic (DHCP) on active adapter(s) for both IPv4 and IPv6." -ForegroundColor Green
 }
 
 function Set-MacRandomization([bool]$Enable) {
@@ -1899,9 +1950,9 @@ function Menu-AdditionalTweaks {
         Write-Host "  ----------------------------------------------------" -ForegroundColor White
         Write-Host "  1. Restore Windows Photo Viewer and set as default"
         Write-Host "  2. Revert - restore Photos app as default"
-        Write-Host "  3. Set DNS to Google (8.8.8.8 / 8.8.4.4)"
-        Write-Host "  4. Set DNS to Cloudflare (1.1.1.1 / 1.0.0.1)"
-        Write-Host "  5. Reset DNS to automatic (DHCP)"
+        Write-Host "  3. Set DNS to Google (IPv4 8.8.8.8/8.8.4.4 + IPv6 2001:4860:4860::8888/::8844)"
+        Write-Host "  4. Set DNS to Cloudflare (IPv4 1.1.1.1/1.0.0.1 + IPv6 2606:4700:4700::1111/::1001)"
+        Write-Host "  5. Reset DNS to automatic (DHCP, both IPv4 and IPv6)"
         Write-Host "  6. Enable MAC address randomization (Wi-Fi)"
         Write-Host "  7. Disable MAC address randomization (Wi-Fi)"
         Write-Host "  0. Back to main menu"
@@ -1934,8 +1985,14 @@ function Menu-AdditionalTweaks {
                     Start-Process "ms-settings:defaultapps"
                 }
             }
-            '3' { Set-DnsProvider "8.8.8.8" "8.8.4.4" "Google"; Write-PrevLog "Additional: DNS set to Google" }
-            '4' { Set-DnsProvider "1.1.1.1" "1.0.0.1" "Cloudflare"; Write-PrevLog "Additional: DNS set to Cloudflare" }
+            '3' {
+                Set-DnsProvider "8.8.8.8" "8.8.4.4" "2001:4860:4860::8888" "2001:4860:4860::8844" "Google"
+                Write-PrevLog "Additional: DNS set to Google (v4+v6)"
+            }
+            '4' {
+                Set-DnsProvider "1.1.1.1" "1.0.0.1" "2606:4700:4700::1111" "2606:4700:4700::1001" "Cloudflare"
+                Write-PrevLog "Additional: DNS set to Cloudflare (v4+v6)"
+            }
             '5' { Reset-DnsAutomatic; Write-PrevLog "Additional: DNS reset to automatic" }
             '6' { Set-MacRandomization $true; Write-PrevLog "Additional: MAC randomization enabled" }
             '7' { Set-MacRandomization $false; Write-PrevLog "Additional: MAC randomization disabled" }
@@ -2021,8 +2078,6 @@ function Menu-Restore {
 function Ensure-RestorePoint {
     try {
         Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
-        # Bypass the default 24h cooldown for this one call so every Apply
-        # really produces a restore point, then restore the previous setting.
         $srKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
         $prevFreq = Get-RegValue $srKey "SystemRestorePointCreationFrequency"
         Set-Reg $srKey "SystemRestorePointCreationFrequency" 0
@@ -2178,6 +2233,7 @@ $Global:SysInfo = Get-SystemInfoOnce
 Assert-FontSmoothingOn
 Register-FontSmoothingEnforcer
 Invoke-SearchBoxMigration
+Invoke-TelemetryPolicyMigration
 
 try {
     while ($true) {
